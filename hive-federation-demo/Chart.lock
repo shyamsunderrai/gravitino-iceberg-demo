@@ -1,0 +1,12 @@
+dependencies:
+- name: gravitino
+  repository: file://../gravitino
+  version: 1.3.0
+- name: hive-metastore
+  repository: file://../hive-metastore
+  version: 0.1.0
+- name: hive-metastore
+  repository: file://../hive-metastore
+  version: 0.1.0
+digest: sha256:c30162c33a2ef7a9d0e8a4dd571e83b18f2ad70cc33a6f879bdc44cab0da7f7e
+generated: "2026-03-15T21:36:47.316264+08:00"

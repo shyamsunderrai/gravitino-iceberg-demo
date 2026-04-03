@@ -1,0 +1,199 @@
+{{- /*
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+  */}}
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hive-metastore.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hive-metastore.labels" . | nindent 4 }}
+  annotations:
+    checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "hive-metastore.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hive-metastore.selectorLabels" . | nindent 8 }}
+        name: {{ include "hive-metastore.fullname" . }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      initContainers:
+
+        # ── Step 1: Download MySQL JDBC connector ──────────────────────────────
+        # The official apache/hive image does not include the MySQL connector,
+        # so we fetch it here and place it on a shared emptyDir volume.
+        - name: download-mysql-connector
+          image: curlimages/curl:8.5.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Downloading MySQL connector..."
+              curl -fSL "{{ .Values.mysqlConnector.url }}" \
+                -o "/extra-jars/{{ .Values.mysqlConnector.jarName }}"
+              echo "Download complete: $(ls -lh /extra-jars/)"
+          resources:
+            {{- toYaml .Values.initResources | nindent 12 }}
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+        # ── Step 2: Wait for MySQL, then initialise the Hive schema ───────────
+        # schematool exits non-zero when the schema already exists; that is
+        # expected on subsequent pod restarts and is treated as success.
+        - name: init-schema
+          image: {{ include "hive-metastore.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - /tmp/conf/init-schema.sh
+          env:
+            - name: HIVE_HOME
+              value: /opt/hive
+            - name: HIVE_CONF_DIR
+              value: /tmp/conf
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: db-root-password
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: db-password
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: s3-access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: s3-secret-key
+          resources:
+            {{- toYaml .Values.initResources | nindent 12 }}
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: hive-conf
+              mountPath: /tmp/conf
+
+      containers:
+        - name: hive-metastore
+          image: {{ include "hive-metastore.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - /tmp/conf/init.sh
+          env:
+            - name: HIVE_HOME
+              value: /opt/hive
+            - name: HIVE_CONF_DIR
+              value: /tmp/conf
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: db-password
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: s3-access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: s3-secret-key
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: thrift
+              containerPort: {{ .Values.hive.thriftPort }}
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: thrift
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: thrift
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: hive-conf
+              mountPath: /tmp/conf
+            {{- if .Values.warehousePersistence.enabled }}
+            - name: warehouse
+              mountPath: /user/hive/warehouse
+            {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      volumes:
+        # Shared volume to pass the MySQL JDBC jar from the download init
+        # container to both the schema-init container and the main container.
+        - name: extra-jars
+          emptyDir: {}
+        - name: hive-conf
+          configMap:
+            name: {{ include "hive-metastore.fullname" . }}
+            defaultMode: 0755
+        - name: warehouse
+          {{- if .Values.warehousePersistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hive-metastore.fullname" . }}-warehouse
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

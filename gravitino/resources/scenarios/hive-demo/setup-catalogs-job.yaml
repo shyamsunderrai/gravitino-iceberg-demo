@@ -1,0 +1,194 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# One-shot Kubernetes Job that bootstraps the Gravitino metalake and registers
+# both Hive Metastore catalogs.
+#
+# Apply AFTER all three Helm releases are up:
+#   kubectl apply -f setup-catalogs-job.yaml
+#
+# Watch progress:
+#   kubectl logs -f job/gravitino-hive-demo-setup
+#
+# Expected service endpoints (all in the same namespace):
+#   Gravitino REST API : http://gravitino:8090
+#   HMS A (operational): thrift://hive-metastore-a:9083
+#   HMS B (analytical) : thrift://hive-metastore-b:9083
+# ─────────────────────────────────────────────────────────────────────────────
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gravitino-hive-demo-setup
+  labels:
+    app: gravitino-hive-demo-setup
+spec:
+  # Re-running the job is safe — the script skips objects that already exist.
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # ── Create MinIO buckets ──────────────────────────────────────────────
+        # Uses the MinIO Client (mc) to create the two warehouse buckets before
+        # HMS starts writing to them.  "--ignore-existing" makes this idempotent.
+        - name: create-minio-buckets
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              MINIO_URL="http://minio.secureagent.svc.cluster.local:9000"
+              MINIO_USER="admin"
+              MINIO_PASS="password"
+
+              echo "==> Configuring mc alias..."
+              mc alias set myminio "${MINIO_URL}" "${MINIO_USER}" "${MINIO_PASS}"
+
+              echo "==> Creating bucket hive-operational ..."
+              mc mb --ignore-existing myminio/hive-operational
+
+              echo "==> Creating bucket hive-analytical ..."
+              mc mb --ignore-existing myminio/hive-analytical
+
+              echo "==> MinIO buckets ready."
+              mc ls myminio
+
+      containers:
+        - name: setup
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              GRAVITINO_URL="http://gravitino:8090"
+              METALAKE="demo"
+
+              # ── helpers ────────────────────────────────────────────────────
+              gravitino_ready() {
+                curl -sf "${GRAVITINO_URL}/api/version" > /dev/null 2>&1
+              }
+
+              metalake_exists() {
+                curl -sf "${GRAVITINO_URL}/api/metalakes/${METALAKE}" > /dev/null 2>&1
+              }
+
+              catalog_exists() {
+                local name="$1"
+                curl -sf "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs/${name}" > /dev/null 2>&1
+              }
+
+              # ── wait for Gravitino ─────────────────────────────────────────
+              echo "==> Waiting for Gravitino at ${GRAVITINO_URL} ..."
+              until gravitino_ready; do
+                echo "    Gravitino not ready, retrying in 5s..."
+                sleep 5
+              done
+              echo "==> Gravitino is up."
+
+              # ── create metalake ────────────────────────────────────────────
+              if metalake_exists; then
+                echo "==> Metalake '${METALAKE}' already exists, skipping."
+              else
+                echo "==> Creating metalake '${METALAKE}'..."
+                curl -sf -X POST "${GRAVITINO_URL}/api/metalakes" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"name\": \"${METALAKE}\",
+                    \"comment\": \"Demo metalake for Hive federation showcase\"
+                  }"
+                echo ""
+                echo "==> Metalake '${METALAKE}' created."
+              fi
+
+              # ── wait for HMS A ─────────────────────────────────────────────
+              echo "==> Waiting for Hive Metastore A (hive-metastore-a:9083)..."
+              until nc -z hive-metastore-a 9083 2>/dev/null; do
+                echo "    HMS A not ready, retrying in 5s..."
+                sleep 5
+              done
+              echo "==> HMS A is up."
+
+              # ── register HMS A as catalog hive_operational ─────────────────
+              if catalog_exists "hive_operational"; then
+                echo "==> Catalog 'hive_operational' already exists, skipping."
+              else
+                echo "==> Registering catalog 'hive_operational' (HMS A)..."
+                curl -sf -X POST \
+                  "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"name\": \"hive_operational\",
+                    \"type\": \"RELATIONAL\",
+                    \"provider\": \"hive\",
+                    \"comment\": \"Operational Hive Metastore — source of truth for production objects\",
+                    \"properties\": {
+                      \"metastore.uris\": \"thrift://hive-metastore-a:9083\"
+                    }
+                  }"
+                echo ""
+                echo "==> Catalog 'hive_operational' registered."
+              fi
+
+              # ── wait for HMS B ─────────────────────────────────────────────
+              echo "==> Waiting for Hive Metastore B (hive-metastore-b:9083)..."
+              until nc -z hive-metastore-b 9083 2>/dev/null; do
+                echo "    HMS B not ready, retrying in 5s..."
+                sleep 5
+              done
+              echo "==> HMS B is up."
+
+              # ── register HMS B as catalog hive_analytical ──────────────────
+              if catalog_exists "hive_analytical"; then
+                echo "==> Catalog 'hive_analytical' already exists, skipping."
+              else
+                echo "==> Registering catalog 'hive_analytical' (HMS B)..."
+                curl -sf -X POST \
+                  "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"name\": \"hive_analytical\",
+                    \"type\": \"RELATIONAL\",
+                    \"provider\": \"hive\",
+                    \"comment\": \"Analytical Hive Metastore — reporting and replication target\",
+                    \"properties\": {
+                      \"metastore.uris\": \"thrift://hive-metastore-b:9083\"
+                    }
+                  }"
+                echo ""
+                echo "==> Catalog 'hive_analytical' registered."
+              fi
+
+              echo ""
+              echo "════════════════════════════════════════════════════════"
+              echo " Setup complete!"
+              echo ""
+              echo " Gravitino UI  : ${GRAVITINO_URL}"
+              echo " Metalake      : ${METALAKE}"
+              echo " Catalogs      : hive_operational  (HMS A)"
+              echo "                 hive_analytical   (HMS B)"
+              echo ""
+              echo " Users can now browse both metastores via Gravitino."
+              echo " Objects created in hive_operational are immediately"
+              echo " visible to hive_analytical users — no sync required."
+              echo "════════════════════════════════════════════════════════"

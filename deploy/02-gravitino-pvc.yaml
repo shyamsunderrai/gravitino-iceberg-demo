@@ -1,0 +1,14 @@
+# PersistentVolumeClaim for Gravitino's H2 embedded database.
+# Mounts at /root/gravitino/data/ so the H2 file (jdbc.mv.db) survives pod restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gravitino-data
+  namespace: gravitino
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 2Gi

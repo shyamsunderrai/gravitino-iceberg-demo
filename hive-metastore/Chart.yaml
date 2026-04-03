@@ -1,0 +1,11 @@
+apiVersion: v2
+name: hive-metastore
+description: A Helm chart for deploying a standalone Apache Hive Metastore service backed by MySQL
+type: application
+version: 0.1.0
+appVersion: "3.1.3"
+keywords:
+  - hive
+  - metastore
+  - hadoop
+  - gravitino

@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Downloads the three Spark connector JARs from Maven Central and uploads
+# them to the MinIO "poc" bucket.  The demo Spark jobs fetch JARs from MinIO
+# at runtime (instant in-cluster transfer vs 8+ min Maven Central download).
+#
+# Run AFTER MinIO is ready and buckets exist.
+# Run BEFORE any Spark demo jobs.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-jar-download
+  labels:
+    app: demo-jar-download
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: download
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BASE="https://repo1.maven.org/maven2"
+              GRAV="org/apache/gravitino/gravitino-spark-connector-runtime-3.5_2.12/1.2.0"
+              HADOOP="org/apache/hadoop/hadoop-aws/3.3.4"
+              AWS="com/amazonaws/aws-java-sdk-bundle/1.12.367"
+
+              echo "==> Downloading Gravitino Spark connector (18 MiB)..."
+              curl -fSL --retry 5 --retry-delay 5 \
+                "$BASE/$GRAV/{{ .Values.spark.gravitinoConnectorJar }}" \
+                -o /jars/{{ .Values.spark.gravitinoConnectorJar }}
+
+              echo "==> Downloading hadoop-aws (940 KiB)..."
+              curl -fSL --retry 5 --retry-delay 5 \
+                "$BASE/$HADOOP/{{ .Values.spark.hadoopAwsJar }}" \
+                -o /jars/{{ .Values.spark.hadoopAwsJar }}
+
+              echo "==> Downloading aws-java-sdk-bundle (296 MiB — may take several minutes)..."
+              curl -fSL --retry 5 --retry-delay 5 \
+                "$BASE/$AWS/{{ .Values.spark.awsSdkJar }}" \
+                -o /jars/{{ .Values.spark.awsSdkJar }}
+
+              echo "==> Downloaded: $(ls -lh /jars/)"
+          volumeMounts:
+            - name: jars
+              mountPath: /jars
+
+      containers:
+        - name: upload
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mc alias set m {{ .Values.minio.endpoint }} \
+                {{ .Values.minio.accessKey }} {{ .Values.minio.secretKey }}
+              mc cp /jars/{{ .Values.spark.gravitinoConnectorJar }} m/{{ .Values.minio.pocBucket }}/
+              mc cp /jars/{{ .Values.spark.hadoopAwsJar }}          m/{{ .Values.minio.pocBucket }}/
+              mc cp /jars/{{ .Values.spark.awsSdkJar }}             m/{{ .Values.minio.pocBucket }}/
+              echo "==> JARs in MinIO poc bucket:"
+              mc ls m/{{ .Values.minio.pocBucket }}/
+          volumeMounts:
+            - name: jars
+              mountPath: /jars
+
+      volumes:
+        - name: jars
+          emptyDir: {}

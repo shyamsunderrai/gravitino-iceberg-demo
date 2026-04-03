@@ -1,0 +1,261 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Demonstrates the Gravitino federation model: Gravitino is a METADATA plane,
+# not a data-plane interceptor. Spark writes directly to HMS A; Gravitino
+# immediately surfaces that data to ALL consumers — no out-of-band sync.
+#
+# Write path:
+#
+#   Spark SQL (INSERT INTO customers ...)
+#     │  spark_catalog → catalogImplementation=hive
+#     ▼
+#   Hive Metastore A  →  thrift://hive-metastore-a:9083
+#     │  returns: LOCATION s3a://hive-operational/warehouse/operational_db.db/customers
+#     ▼
+#   Spark writes Parquet files to MinIO
+#     →  s3a://hive-operational/warehouse/operational_db.db/customers/
+#
+# Gravitino federation (verify after job completes):
+#   Any data written to HMS A appears IMMEDIATELY under
+#   Gravitino  →  demo > hive_operational > operational_db
+#   with NO synchronisation step — that is the demo point.
+#
+# PRE-REQUISITES:
+#   1. MinIO bucket "poc" contains the three JARs:
+#        gravitino-spark-connector-runtime-3.5_2.12-1.2.0.jar
+#        hadoop-aws-3.3.4.jar
+#        aws-java-sdk-bundle-1.12.367.jar
+#      (Fetched at runtime by the fetch-jars init container via minio/mc.)
+#
+#   2. create-dummy-data-job.yaml completed (tables must exist in HMS A)
+#
+# Apply:
+#   kubectl apply -f spark-write-demo-job.yaml -n gravitino-demo
+#   kubectl logs -f job/spark-write-demo -n gravitino-demo -c spark-sql
+#
+# After completion verify:
+#   1. Gravitino UI → demo > hive_operational > operational_db — all tables
+#   2. MinIO console → hive-operational bucket → warehouse/ — Parquet files
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ConfigMap: SQL script ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-write-demo-sql
+  labels:
+    app: spark-write-demo
+data:
+  write-data.sql: |
+    -- ── Gravitino Federation Demo — Data Write ────────────────────────────
+    --
+    -- Architecture:
+    --   Gravitino is a METADATA plane — it federates catalog visibility.
+    --   Data writes go directly to HMS A via Spark's Hive metastore client.
+    --   The key demo point: any data written to HMS A is IMMEDIATELY visible
+    --   through Gravitino to all federated consumers (HMS B analysts), with
+    --   no out-of-band synchronisation.
+    --
+    -- Write path:
+    --   Spark SQL → spark_catalog (configured with HMS A Thrift URI)
+    --             → HMS A  thrift://hive-metastore-a:9083
+    --             → MinIO  s3a://hive-operational/warehouse/operational_db.db/
+    --
+    -- Verify via Gravitino REST/UI after this job completes:
+    --   Gravitino federates HMS A transparently — data appears under
+    --   demo > hive_operational > operational_db without any sync step.
+
+    USE operational_db;
+
+    SET hive.exec.dynamic.partition = true;
+    SET hive.exec.dynamic.partition.mode = nonstrict;
+
+    SHOW TABLES;
+
+    -- ── Customers ─────────────────────────────────────────────────────────
+    INSERT INTO customers VALUES
+      (1,  'Alice Johnson', 'alice@example.com',  'AMER', 'ENTERPRISE', '2024-01-15'),
+      (2,  'Bob Smith',     'bob@example.com',    'EMEA', 'PREMIUM',    '2024-02-20'),
+      (3,  'Carol White',   'carol@example.com',  'APAC', 'STANDARD',   '2024-03-10'),
+      (4,  'David Kim',     'david@example.com',  'AMER', 'PREMIUM',    '2024-04-05'),
+      (5,  'Emma Garcia',   'emma@example.com',   'EMEA', 'ENTERPRISE', '2024-05-22');
+    SELECT 'customers' AS tbl, COUNT(*) AS rows FROM customers;
+
+    -- ── Products ──────────────────────────────────────────────────────────
+    INSERT INTO products VALUES
+      (101, 'Widget Pro',     'Hardware', 'Connectors',   29.99, true),
+      (102, 'DataPipe SDK',   'Software', 'Integration', 299.00, true),
+      (103, 'CloudSync',      'Software', 'Storage',     149.00, true),
+      (104, 'EdgeSensor Kit', 'Hardware', 'IoT',          89.99, true),
+      (105, 'Legacy Adapter', 'Hardware', 'Connectors',    9.99, false);
+    SELECT 'products' AS tbl, COUNT(*) AS rows FROM products;
+
+    -- ── Orders ────────────────────────────────────────────────────────────
+    INSERT INTO orders VALUES
+      (1001, 1, 101, 2,  29.99, '2024-06-01', 'DELIVERED'),
+      (1002, 2, 102, 1, 299.00, '2024-06-03', 'DELIVERED'),
+      (1003, 3, 103, 3, 149.00, '2024-06-05', 'SHIPPED'),
+      (1004, 1, 104, 1,  89.99, '2024-06-07', 'DELIVERED'),
+      (1005, 4, 101, 5,  29.99, '2024-06-10', 'PENDING'),
+      (1006, 5, 102, 2, 299.00, '2024-06-12', 'SHIPPED'),
+      (1007, 2, 105,10,   9.99, '2024-06-15', 'DELIVERED'),
+      (1008, 3, 101, 1,  29.99, '2024-06-18', 'CANCELLED'),
+      (1009, 4, 103, 2, 149.00, '2024-06-20', 'DELIVERED'),
+      (1010, 5, 104, 3,  89.99, '2024-06-22', 'PENDING');
+    SELECT 'orders' AS tbl, COUNT(*) AS rows FROM orders;
+
+    -- ── Raw events (partitioned by event_date and region) ─────────────────
+    INSERT INTO raw_events VALUES
+      (9001, 1, 'page_view',   'sess-aaa', '{"page":"/home"}',       '2024-06-01', 'AMER'),
+      (9002, 2, 'add_to_cart', 'sess-bbb', '{"product_id":102}',     '2024-06-01', 'EMEA'),
+      (9003, 1, 'purchase',    'sess-aaa', '{"order_id":1001}',      '2024-06-01', 'AMER'),
+      (9004, 3, 'page_view',   'sess-ccc', '{"page":"/products"}',   '2024-06-02', 'APAC'),
+      (9005, 4, 'add_to_cart', 'sess-ddd', '{"product_id":101}',     '2024-06-02', 'AMER'),
+      (9006, 5, 'purchase',    'sess-eee', '{"order_id":1006}',      '2024-06-12', 'EMEA'),
+      (9007, 3, 'refund',      'sess-fff', '{"order_id":1008}',      '2024-06-18', 'APAC');
+    SELECT 'raw_events' AS tbl, COUNT(*) AS rows FROM raw_events;
+
+---
+# ── Job ───────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-write-demo
+  labels:
+    app: spark-write-demo
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # ── Copy JARs from MinIO poc bucket (in-cluster, instant) ────────────
+        - name: fetch-jars
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mc alias set m http://minio.secureagent.svc.cluster.local:9000 admin password
+              mc cp m/poc/gravitino-spark-connector-runtime-3.5_2.12-1.2.0.jar /extra-jars/gravitino-spark-connector-runtime.jar
+              mc cp m/poc/hadoop-aws-3.3.4.jar                                 /extra-jars/hadoop-aws.jar
+              mc cp m/poc/aws-java-sdk-bundle-1.12.367.jar                     /extra-jars/aws-java-sdk-bundle.jar
+              echo "==> JARs ready: $(ls -lh /extra-jars/)"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+      containers:
+        - name: spark-sql
+          image: apache/spark:3.5.1
+          resources:
+            requests:
+              memory: "1.5Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "══════════════════════════════════════════════════════════"
+              echo " Gravitino Federation Demo — Write path:"
+              echo ""
+              echo "  Spark SQL  →  spark_catalog (catalogImplementation=hive)"
+              echo "             →  HMS A  thrift://hive-metastore-a:9083"
+              echo "             →  MinIO  s3a://hive-operational/warehouse/"
+              echo ""
+              echo "  Gravitino federates this data to all consumers instantly"
+              echo "  (demo > hive_operational > operational_db) — no sync step."
+              echo "══════════════════════════════════════════════════════════"
+              echo ""
+
+              echo "==> Checking Gravitino REST API at http://gravitino:8090 ..."
+              GRAVITINO_STATUS=$(wget -qO- --server-response \
+                "http://gravitino:8090/api/version" 2>&1 | grep "HTTP/" | awk '{print $2}' || echo "unreachable")
+              echo "    Gravitino HTTP status: $GRAVITINO_STATUS"
+
+              echo "==> JARs available:"
+              ls -lh /extra-jars/
+              echo ""
+
+              JARS=$(ls /extra-jars/*.jar | tr '\n' ':' | sed 's/:$//')
+
+              /opt/spark/bin/spark-sql \
+                --master local[2] \
+                \
+                `# ── Classpath: S3A JARs must be on driver path before SparkContext ` \
+                --conf "spark.driver.extraClassPath=$JARS" \
+                \
+                `# ── Hive catalog: point directly at HMS A for writes ────────────` \
+                --conf "spark.sql.catalogImplementation=hive" \
+                --conf "spark.hadoop.hive.metastore.uris=thrift://hive-metastore-a:9083" \
+                --conf "spark.hadoop.hive.metastore.warehouse.dir=s3a://hive-operational/warehouse" \
+                \
+                `# ── Memory ────────────────────────────────────────────────────── ` \
+                --conf "spark.driver.memory=1g" \
+                \
+                `# ── S3A → MinIO ───────────────────────────────────────────────── ` \
+                --conf "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem" \
+                --conf "spark.hadoop.fs.AbstractFileSystem.s3a.impl=org.apache.hadoop.fs.s3a.S3A" \
+                --conf "spark.hadoop.fs.s3a.endpoint=http://minio.secureagent.svc.cluster.local:9000" \
+                --conf "spark.hadoop.fs.s3a.access.key=admin" \
+                --conf "spark.hadoop.fs.s3a.secret.key=password" \
+                --conf "spark.hadoop.fs.s3a.path.style.access=true" \
+                --conf "spark.hadoop.fs.s3a.connection.ssl.enabled=false" \
+                \
+                -f /tmp/write-data.sql
+
+              echo ""
+              echo "══════════════════════════════════════════════════════════"
+              echo " Write complete!  Data is now in MinIO."
+              echo ""
+              echo " To verify:"
+              echo "  1. Gravitino UI  http://localhost:30329"
+              echo "     demo > hive_operational > operational_db > <table>"
+              echo ""
+              echo "  2. MinIO console"
+              echo "     hive-operational > warehouse > operational_db.db >"
+              echo "       customers/   (Parquet files)"
+              echo "       products/    (Parquet files)"
+              echo "       orders/      (Parquet files)"
+              echo "       raw_events/  (partitioned: event_date=.../region=...)"
+              echo ""
+              echo "  3. hive-analytical bucket remains EMPTY — proving"
+              echo "     Gravitino federates without out-of-band sync."
+              echo "══════════════════════════════════════════════════════════"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: sql-scripts
+              mountPath: /tmp/write-data.sql
+              subPath: write-data.sql
+
+      volumes:
+        - name: extra-jars
+          emptyDir: {}
+        - name: sql-scripts
+          configMap:
+            name: spark-write-demo-sql

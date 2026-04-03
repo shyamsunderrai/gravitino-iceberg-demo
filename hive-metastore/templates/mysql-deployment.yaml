@@ -1,0 +1,85 @@
+{{- /*
+    Licensed to the Apache Software Foundation (ASF) under one
+    or more contributor license agreements.  See the NOTICE file
+    distributed with this work for additional information
+    regarding copyright ownership.  The ASF licenses this file
+    to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+  */}}
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hive-metastore.fullname" . }}-mysql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hive-metastore.labels" . | nindent 4 }}
+    component: mysql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "hive-metastore.name" . }}-mysql
+      release: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "hive-metastore.name" . }}-mysql
+        release: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: mysql
+          image: {{ include "hive-metastore.mysqlImage" . }}
+          imagePullPolicy: {{ .Values.mysql.image.pullPolicy }}
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: db-root-password
+            - name: MYSQL_DATABASE
+              value: {{ .Values.mysql.database | quote }}
+            - name: MYSQL_USER
+              value: {{ .Values.mysql.username | quote }}
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "hive-metastore.secretName" . }}
+                  key: db-password
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: 3306
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 3306
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: mysql-data
+              mountPath: {{ .Values.mysql.persistence.mountPath | default "/var/lib/mysql" }}
+      volumes:
+        - name: mysql-data
+          {{- if .Values.mysql.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "hive-metastore.fullname" . }}-mysql-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

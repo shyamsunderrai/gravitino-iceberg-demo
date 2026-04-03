@@ -1,0 +1,135 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# hive-federation-demo — consolidated values
+#
+# MinIO is deployed separately (see deploy.sh).  Set minio.endpoint to point
+# to your MinIO instance (in-cluster service URL or external address).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── MinIO connection (must be reachable from all pods) ───────────────────────
+minio:
+  endpoint: "http://demo-minio:9000"   # in-cluster service name from deploy.sh
+  accessKey: "admin"
+  secretKey: "password"
+  # Buckets are created by deploy.sh before helm install runs
+  operationalBucket: "hive-operational"
+  analyticalBucket:  "hive-analytical"
+  pocBucket:         "poc"             # stores Spark connector JARs
+
+# ── Namespace (must match where helm is installed) ────────────────────────────
+namespace: gravitino-demo
+
+# ── Gravitino subchart values ─────────────────────────────────────────────────
+gravitino:
+  image:
+    tag: "1.2.0-rc11"   # 1.3.0-SNAPSHOT not published; use latest rc
+
+  mysql:
+    enabled: true
+    auth:
+      rootPassword: "gravitino"
+      database: gravitino
+      username: gravitino
+      password: gravitino
+
+  entity:
+    jdbcUrl: "jdbc:mysql://gravitino-mysql:3306/gravitino?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+    jdbcDriver: "com.mysql.cj.jdbc.Driver"
+    jdbcUser: "gravitino"
+    jdbcPassword: "gravitino"
+    storagePath: /root/gravitino/data/jdbc
+
+  persistence:
+    enabled: true
+    existingClaim: gravitino-storage   # pre-created by deploy.sh
+
+  service:
+    name: gravitino
+    type: ClusterIP    # use port-forward to access UI; set NodePort if preferred
+    port: 8090
+    targetPort: 8090
+
+  auxService:
+    names: ""
+
+  env:
+    - name: GRAVITINO_HOME
+      value: /root/gravitino
+    - name: GRAVITINO_MEM
+      value: "-Xms512m -Xmx1024m -XX:MaxMetaspaceSize=256m"
+
+  additionalLog4j2Properties:
+    appender.console.type: Console
+    appender.console.name: consoleLogger
+    appender.console.layout.type: PatternLayout
+    appender.console.layout.pattern: "%d{yyyy-MM-dd HH:mm:ss} %-5p [%t] %c{1}:%L - %m%n"
+    rootLogger.appenderRef.console.ref: consoleLogger
+
+# ── Hive Metastore A — Operational cluster ───────────────────────────────────
+hive-metastore-a:
+  fullnameOverride: "hive-metastore-a"
+
+  mysql:
+    database: hive_operational
+    username: hive
+    password: hive
+    rootPassword: hiveroot
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClass: ""   # leave empty to use cluster default
+
+  minio:
+    endpoint: "http://demo-minio:9000"
+    accessKey: "admin"
+    secretKey: "password"
+    bucket: "hive-operational"
+    pathStyleAccess: "true"
+    sslEnabled: "false"
+
+  hive:
+    warehouseDir: "s3a://hive-operational/warehouse"
+    thriftPort: 9083
+
+# ── Hive Metastore B — Analytical cluster ────────────────────────────────────
+hive-metastore-b:
+  fullnameOverride: "hive-metastore-b"
+
+  mysql:
+    database: hive_analytical
+    username: hive
+    password: hive
+    rootPassword: hiveroot
+    persistence:
+      enabled: true
+      size: 5Gi
+      storageClass: ""
+
+  minio:
+    endpoint: "http://demo-minio:9000"
+    accessKey: "admin"
+    secretKey: "password"
+    bucket: "hive-analytical"
+    pathStyleAccess: "true"
+    sslEnabled: "false"
+
+  hive:
+    warehouseDir: "s3a://hive-analytical/warehouse"
+    thriftPort: 9083
+
+# ── Gravitino PVC (pre-created by deploy.sh before helm install) ──────────────
+gravitinoPvc:
+  size: 5Gi
+  storageClass: ""   # leave empty to use cluster default
+
+# ── Spark connector JAR versions (downloaded by setup jobs) ──────────────────
+spark:
+  image: apache/spark:3.5.1
+  gravitinoConnectorJar: "gravitino-spark-connector-runtime-3.5_2.12-1.2.0.jar"
+  hadoopAwsJar: "hadoop-aws-3.3.4.jar"
+  awsSdkJar: "aws-java-sdk-bundle-1.12.367.jar"
+
+# ── Gravitino metalake + catalog names used in setup jobs ────────────────────
+demo:
+  metalake: demo
+  operationalCatalog: hive_operational
+  analyticalCatalog:  hive_analytical

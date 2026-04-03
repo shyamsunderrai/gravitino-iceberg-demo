@@ -1,0 +1,92 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Creates the Gravitino metalake and registers both HMS clusters as catalogs.
+# Run after MinIO buckets exist and all pods are Ready.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-setup-catalogs
+  labels:
+    app: demo-setup-catalogs
+spec:
+  backoffLimit: 5
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              GRAVITINO_URL="http://gravitino:8090"
+              METALAKE="{{ .Values.demo.metalake }}"
+
+              gravitino_ready() { curl -sf "${GRAVITINO_URL}/api/version" > /dev/null 2>&1; }
+              metalake_exists() { curl -sf "${GRAVITINO_URL}/api/metalakes/${METALAKE}" > /dev/null 2>&1; }
+              catalog_exists()  { curl -sf "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs/$1" > /dev/null 2>&1; }
+              hms_ready()       { (echo > /dev/tcp/$1/9083) 2>/dev/null; }
+
+              echo "==> Waiting for Gravitino..."
+              until gravitino_ready; do sleep 5; done
+              echo "==> Gravitino up."
+
+              if metalake_exists; then
+                echo "==> Metalake '${METALAKE}' already exists."
+              else
+                echo "==> Creating metalake '${METALAKE}'..."
+                curl -sf -X POST "${GRAVITINO_URL}/api/metalakes" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"name\":\"${METALAKE}\",\"comment\":\"Gravitino Hive federation demo\"}"
+                echo ""
+              fi
+
+              echo "==> Waiting for HMS A (hive-metastore-a:9083)..."
+              until hms_ready hive-metastore-a; do sleep 5; done
+              echo "==> HMS A up."
+
+              if catalog_exists "{{ .Values.demo.operationalCatalog }}"; then
+                echo "==> Catalog '{{ .Values.demo.operationalCatalog }}' already exists."
+              else
+                echo "==> Registering catalog '{{ .Values.demo.operationalCatalog }}'..."
+                curl -sf -X POST "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"name\": \"{{ .Values.demo.operationalCatalog }}\",
+                    \"type\": \"RELATIONAL\",
+                    \"provider\": \"hive\",
+                    \"comment\": \"Operational HMS — production source of truth\",
+                    \"properties\": {\"metastore.uris\": \"thrift://hive-metastore-a:9083\"}
+                  }"
+                echo ""
+              fi
+
+              echo "==> Waiting for HMS B (hive-metastore-b:9083)..."
+              until hms_ready hive-metastore-b; do sleep 5; done
+              echo "==> HMS B up."
+
+              if catalog_exists "{{ .Values.demo.analyticalCatalog }}"; then
+                echo "==> Catalog '{{ .Values.demo.analyticalCatalog }}' already exists."
+              else
+                echo "==> Registering catalog '{{ .Values.demo.analyticalCatalog }}'..."
+                curl -sf -X POST "${GRAVITINO_URL}/api/metalakes/${METALAKE}/catalogs" \
+                  -H "Content-Type: application/json" \
+                  -d "{
+                    \"name\": \"{{ .Values.demo.analyticalCatalog }}\",
+                    \"type\": \"RELATIONAL\",
+                    \"provider\": \"hive\",
+                    \"comment\": \"Analytical HMS — reporting and replication target\",
+                    \"properties\": {\"metastore.uris\": \"thrift://hive-metastore-b:9083\"}
+                  }"
+                echo ""
+              fi
+
+              echo ""
+              echo "════════════════════════════════════════════════════════"
+              echo " Catalogs registered in Gravitino metalake: ${METALAKE}"
+              echo "   {{ .Values.demo.operationalCatalog }} → thrift://hive-metastore-a:9083"
+              echo "   {{ .Values.demo.analyticalCatalog }}  → thrift://hive-metastore-b:9083"
+              echo "════════════════════════════════════════════════════════"

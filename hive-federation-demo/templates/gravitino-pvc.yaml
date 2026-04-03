@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gravitino-storage
+  labels:
+    app: gravitino
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.gravitinoPvc.size }}
+  {{- if .Values.gravitinoPvc.storageClass }}
+  storageClassName: {{ .Values.gravitinoPvc.storageClass }}
+  {{- end }}

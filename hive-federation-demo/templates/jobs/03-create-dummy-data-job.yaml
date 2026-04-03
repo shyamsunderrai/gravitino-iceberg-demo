@@ -1,0 +1,157 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Creates operational_db and 4 sample tables in HMS A.
+# Run after setup-catalogs-job completes.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-ddl
+  labels:
+    app: demo-create-tables
+data:
+  create-tables.sql: |
+    CREATE DATABASE IF NOT EXISTS operational_db
+      COMMENT 'Operational data — source of truth'
+      LOCATION 's3a://{{ .Values.minio.operationalBucket }}/warehouse/operational_db.db';
+
+    USE operational_db;
+
+    CREATE TABLE IF NOT EXISTS customers (
+      customer_id  BIGINT  COMMENT 'Surrogate key',
+      name         STRING  COMMENT 'Full name',
+      email        STRING  COMMENT 'Primary contact email',
+      region       STRING  COMMENT 'Geographic region: AMER | EMEA | APAC',
+      tier         STRING  COMMENT 'Contract tier: STANDARD | PREMIUM | ENTERPRISE',
+      signup_date  STRING  COMMENT 'ISO-8601 registration date'
+    ) STORED AS PARQUET
+    LOCATION 's3a://{{ .Values.minio.operationalBucket }}/warehouse/operational_db.db/customers';
+
+    CREATE TABLE IF NOT EXISTS products (
+      product_id   BIGINT  COMMENT 'Surrogate key',
+      name         STRING  COMMENT 'Display name',
+      category     STRING  COMMENT 'Top-level category',
+      sub_category STRING  COMMENT 'Sub-category',
+      list_price   DOUBLE  COMMENT 'Published price in USD',
+      is_active    BOOLEAN COMMENT 'Whether currently offered'
+    ) STORED AS PARQUET
+    LOCATION 's3a://{{ .Values.minio.operationalBucket }}/warehouse/operational_db.db/products';
+
+    CREATE TABLE IF NOT EXISTS orders (
+      order_id    BIGINT  COMMENT 'Surrogate key',
+      customer_id BIGINT  COMMENT 'FK → customers',
+      product_id  BIGINT  COMMENT 'FK → products',
+      quantity    INT     COMMENT 'Units ordered',
+      unit_price  DOUBLE  COMMENT 'Price at time of order in USD',
+      order_date  STRING  COMMENT 'ISO-8601 order date',
+      status      STRING  COMMENT 'PENDING | SHIPPED | DELIVERED | CANCELLED'
+    ) STORED AS PARQUET
+    LOCATION 's3a://{{ .Values.minio.operationalBucket }}/warehouse/operational_db.db/orders';
+
+    CREATE TABLE IF NOT EXISTS raw_events (
+      event_id    BIGINT  COMMENT 'Unique event identifier',
+      customer_id BIGINT  COMMENT 'FK → customers',
+      event_type  STRING  COMMENT 'page_view | add_to_cart | purchase | refund',
+      session_id  STRING  COMMENT 'Browser session identifier',
+      payload     STRING  COMMENT 'JSON event attributes'
+    ) PARTITIONED BY (
+      event_date  STRING  COMMENT 'ISO-8601 date partition key',
+      region      STRING  COMMENT 'Geographic region partition key'
+    ) STORED AS PARQUET
+    LOCATION 's3a://{{ .Values.minio.operationalBucket }}/warehouse/operational_db.db/raw_events';
+
+    SHOW DATABASES;
+    SHOW TABLES IN operational_db;
+
+  hive-site.xml: |
+    <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+    <configuration>
+      <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://hive-metastore-a:9083</value>
+      </property>
+      <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>s3a://{{ .Values.minio.operationalBucket }}/warehouse</value>
+      </property>
+      <property>
+        <name>hive.exec.scratchdir</name>
+        <value>/tmp/hive-scratch</value>
+      </property>
+      <property>
+        <name>hive.exec.local.scratchdir</name>
+        <value>/tmp/hive-local</value>
+      </property>
+    </configuration>
+
+  core-site.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <configuration>
+      <property><name>fs.defaultFS</name><value>file:///</value></property>
+      <property><name>fs.s3a.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
+      <property><name>fs.AbstractFileSystem.s3a.impl</name><value>org.apache.hadoop.fs.s3a.S3A</value></property>
+      <property><name>fs.s3a.endpoint</name><value>{{ .Values.minio.endpoint }}</value></property>
+      <property><name>fs.s3a.access.key</name><value>{{ .Values.minio.accessKey }}</value></property>
+      <property><name>fs.s3a.secret.key</name><value>{{ .Values.minio.secretKey }}</value></property>
+      <property><name>fs.s3a.path.style.access</name><value>true</value></property>
+      <property><name>fs.s3a.connection.ssl.enabled</name><value>false</value></property>
+    </configuration>
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-create-tables
+  labels:
+    app: demo-create-tables
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: download-mysql-connector
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              curl -fSL --retry 5 --retry-delay 5 \
+                "https://repo1.maven.org/maven2/mysql/mysql-connector-java/8.0.28/mysql-connector-java-8.0.28.jar" \
+                -o /extra-jars/mysql-connector-java-8.0.28.jar
+              echo "Downloaded: $(ls -lh /extra-jars/)"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+      containers:
+        - name: hive-cli
+          image: apache/hive:3.1.3
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              export HIVE_AUX_JARS_PATH="/extra-jars"
+              export HADOOP_CLASSPATH="${HADOOP_HOME:-/opt/hadoop}/share/hadoop/tools/lib/*"
+              export HADOOP_CONF_DIR="/tmp/conf"
+              export HIVE_CONF_DIR="/tmp/conf"
+              echo "==> Creating tables in HMS A..."
+              "${HIVE_HOME}/bin/hive" -f /tmp/conf/create-tables.sql
+              echo "==> Tables created in operational_db."
+          env:
+            - name: HIVE_HOME
+              value: /opt/hive
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: hive-conf
+              mountPath: /tmp/conf
+
+      volumes:
+        - name: extra-jars
+          emptyDir: {}
+        - name: hive-conf
+          configMap:
+            name: demo-ddl
+            defaultMode: 0755

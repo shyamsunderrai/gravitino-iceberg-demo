@@ -1,0 +1,142 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+## Override the chart name
+##
+nameOverride: ""
+fullnameOverride: ""
+
+## Hive Metastore image
+##
+image:
+  registry: docker.io
+  repository: apache/hive
+  tag: "3.1.3"
+  pullPolicy: IfNotPresent
+
+## MySQL JDBC connector download URL.
+## The apache/hive image does not bundle the MySQL connector, so it is
+## fetched at pod startup by an init container.
+##
+mysqlConnector:
+  # mysql-connector-java was renamed to mysql-connector-j at 8.0.31.
+  # 8.0.28 is the last reliable version under the old artifact coordinates.
+  url: "https://repo1.maven.org/maven2/mysql/mysql-connector-java/8.0.28/mysql-connector-java-8.0.28.jar"
+  jarName: "mysql-connector-java-8.0.28.jar"
+
+## MySQL configuration — a dedicated MySQL instance is deployed alongside
+## each Hive Metastore so every release is fully self-contained.
+##
+mysql:
+  # Using the same bitnami image already cached on the cluster nodes (pulled
+  # by the Gravitino subchart). Avoids repeated Docker Hub pull failures.
+  image:
+    registry: docker.io
+    repository: bitnamilegacy/mysql
+    tag: "8.0.36-debian-12-r12"
+    pullPolicy: IfNotPresent
+  database: hive_metastore
+  username: hive
+  password: hive
+  rootPassword: hiveroot
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+
+## MinIO (S3-compatible) object storage used as the Hive warehouse.
+## The MinIO cluster is assumed to be running in namespace "secureagent".
+## Adjust endpoint/credentials to match your deployment.
+##
+minio:
+  ## MinIO service endpoint reachable from this namespace.
+  ## Format: http://<service>.<namespace>.svc.cluster.local:<port>
+  ##
+  endpoint: "http://minio.secureagent.svc.cluster.local:9000"
+  accessKey: "minioadmin"
+  secretKey: "minioadmin"
+  ## Bucket that will hold all warehouse data for this metastore instance.
+  ## The setup-catalogs Job will create it if it does not already exist.
+  ##
+  bucket: "hive"
+  ## Required for MinIO — it does not support virtual-hosted-style URLs.
+  ##
+  pathStyleAccess: "true"
+  sslEnabled: "false"
+
+## Hive Metastore configuration
+##
+hive:
+  ## Thrift port the metastore listens on
+  ##
+  thriftPort: 9083
+  ## Warehouse directory on MinIO. The bucket must exist before HMS starts.
+  ## Pattern: s3a://<bucket>/warehouse
+  ##
+  warehouseDir: "s3a://hive/warehouse"
+  ## Additional hive-site.xml properties as key/value pairs
+  ##
+  extraSiteXml: {}
+    # hive.server2.enable.doAs: "false"
+
+## Warehouse PVC — not needed when MinIO is the warehouse backend.
+## Kept for completeness; disabled by default.
+##
+warehousePersistence:
+  enabled: false
+  size: 10Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+## Kubernetes Service for the Hive Metastore Thrift endpoint
+##
+service:
+  type: ClusterIP
+  port: 9083
+  annotations: {}
+
+## Resource requests/limits for the Hive Metastore container
+##
+resources: {}
+#  requests:
+#    cpu: 500m
+#    memory: 1Gi
+#  limits:
+#    cpu: 1000m
+#    memory: 2Gi
+
+## Resource requests/limits for init containers
+##
+initResources: {}
+
+## Extra environment variables injected into the metastore container
+##
+extraEnv: []
+#  - name: FOO
+#    value: bar
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

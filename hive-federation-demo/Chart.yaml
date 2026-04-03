@@ -1,0 +1,36 @@
+apiVersion: v2
+name: hive-federation-demo
+description: >
+  Gravitino Hive Federation Demo — two independent Hive Metastore clusters
+  (operational + analytical) unified under a single Gravitino metalake.
+  Includes MinIO for object storage, three MySQL instances, and automated
+  setup jobs that populate the demo with sample data.
+type: application
+version: 0.1.0
+appVersion: "1.2.0"
+keywords:
+  - gravitino
+  - hive
+  - metastore
+  - federation
+  - lakehouse
+maintainers:
+  - name: Gravitino
+    email: dev@gravitino.apache.org
+dependencies:
+  # ── Gravitino (includes its own bitnami/mysql subchart for entity store) ──
+  - name: gravitino
+    version: "1.3.0"
+    repository: "file://../gravitino"
+
+  # ── Hive Metastore A — Operational cluster ────────────────────────────────
+  - name: hive-metastore
+    version: "0.1.0"
+    repository: "file://../hive-metastore"
+    alias: hive-metastore-a
+
+  # ── Hive Metastore B — Analytical cluster ────────────────────────────────
+  - name: hive-metastore
+    version: "0.1.0"
+    repository: "file://../hive-metastore"
+    alias: hive-metastore-b

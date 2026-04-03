@@ -1,0 +1,63 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Hive Metastore A — Operational Cluster
+#
+# Represents the production/operational metastore that teams write new
+# objects into.  All objects created here are exposed to Hive Metastore B
+# users via Gravitino without any out-of-band synchronisation.
+#
+# Install with:
+#   helm install hive-metastore-a ../../hive-metastore \
+#     -f hive-metastore-a-values.yaml
+#
+# The fullnameOverride pins the Kubernetes service name to "hive-metastore-a"
+# so that the setup-catalogs Job can reference it by a known hostname.
+# ─────────────────────────────────────────────────────────────────────────────
+
+fullnameOverride: "hive-metastore-a"
+
+# ── MySQL instance #2 of 3 (operational metastore backend) ───────────────────
+# Docker Desktop's default storage class is "hostpath"; leave storageClass
+# empty to use whatever the cluster default is, or set it explicitly.
+mysql:
+  database: hive_operational
+  username: hive
+  password: hive
+  rootPassword: hiveroot
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""   # set to "hostpath" if Docker Desktop does not pick it up
+
+# ── MinIO — warehouse storage (secureagent namespace) ────────────────────────
+# Adjust endpoint/credentials to match your MinIO deployment.
+# The bucket "hive-operational" will be created by the setup-catalogs Job.
+minio:
+  endpoint: "http://minio.secureagent.svc.cluster.local:9000"
+  accessKey: "admin"
+  secretKey: "password"
+  bucket: "hive-operational"
+  pathStyleAccess: "true"
+  sslEnabled: "false"
+
+# ── Hive configuration ────────────────────────────────────────────────────────
+hive:
+  warehouseDir: "s3a://hive-operational/warehouse"
+  thriftPort: 9083

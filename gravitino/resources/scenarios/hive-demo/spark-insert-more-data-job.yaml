@@ -1,0 +1,193 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Inserts a second batch of records into the operational tables in HMS A.
+#
+# Write path:
+#   Spark SQL → spark_catalog (catalogImplementation=hive)
+#             → HMS A  thrift://hive-metastore-a:9083
+#             → MinIO  s3a://hive-operational/warehouse/operational_db.db/
+#
+# After the first spark-write-demo-job.yaml run the tables already have
+# 5 customers, 5 products, 10 orders, 7 events.  This job appends a second
+# batch (IDs 6-10 / 106-110 / 1011-1020 / 9008-9015) so the row counts grow.
+#
+# Apply:
+#   kubectl apply -f spark-insert-more-data-job.yaml -n gravitino-demo
+#   kubectl logs -f job/spark-insert-more -n gravitino-demo -c spark-sql
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ConfigMap: SQL script ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-insert-more-sql
+  labels:
+    app: spark-insert-more
+data:
+  insert-more.sql: |
+    USE operational_db;
+
+    SET hive.exec.dynamic.partition = true;
+    SET hive.exec.dynamic.partition.mode = nonstrict;
+
+    SHOW TABLES;
+    SELECT 'BEFORE — customers' AS label, COUNT(*) AS rows FROM customers;
+    SELECT 'BEFORE — products'  AS label, COUNT(*) AS rows FROM products;
+    SELECT 'BEFORE — orders'    AS label, COUNT(*) AS rows FROM orders;
+    SELECT 'BEFORE — raw_events' AS label, COUNT(*) AS rows FROM raw_events;
+
+    -- ── Customers (batch 2: IDs 6-10) ─────────────────────────────────────
+    INSERT INTO customers VALUES
+      (6,  'Frank Lee',      'frank@example.com',    'APAC', 'PREMIUM',    '2024-07-01'),
+      (7,  'Grace Chen',     'grace@example.com',    'AMER', 'STANDARD',   '2024-07-15'),
+      (8,  'Hideo Tanaka',   'hideo@example.com',    'APAC', 'ENTERPRISE', '2024-08-03'),
+      (9,  'Irina Petrov',   'irina@example.com',    'EMEA', 'PREMIUM',    '2024-08-20'),
+      (10, 'James Okafor',   'james@example.com',    'AMER', 'ENTERPRISE', '2024-09-10');
+
+    -- ── Products (batch 2: IDs 106-110) ───────────────────────────────────
+    INSERT INTO products VALUES
+      (106, 'SecureVault',    'Software', 'Security',    499.00, true),
+      (107, 'FlowRouter',     'Hardware', 'Networking',  199.99, true),
+      (108, 'DataLens Pro',   'Software', 'Analytics',   349.00, true),
+      (109, 'EdgeCompute X',  'Hardware', 'IoT',         299.99, true),
+      (110, 'Legacy Bridge',  'Software', 'Integration',  49.99, false);
+
+    -- ── Orders (batch 2: IDs 1011-1020) ───────────────────────────────────
+    INSERT INTO orders VALUES
+      (1011, 6,  106, 1, 499.00, '2024-07-05', 'DELIVERED'),
+      (1012, 7,  107, 2, 199.99, '2024-07-08', 'DELIVERED'),
+      (1013, 8,  108, 1, 349.00, '2024-07-12', 'SHIPPED'),
+      (1014, 9,  109, 3, 299.99, '2024-07-20', 'DELIVERED'),
+      (1015, 10, 101, 4,  29.99, '2024-07-25', 'PENDING'),
+      (1016, 6,  103, 2, 149.00, '2024-08-01', 'DELIVERED'),
+      (1017, 7,  106, 1, 499.00, '2024-08-05', 'SHIPPED'),
+      (1018, 8,  104, 5,  89.99, '2024-08-10', 'DELIVERED'),
+      (1019, 9,  102, 1, 299.00, '2024-08-15', 'CANCELLED'),
+      (1020, 10, 108, 2, 349.00, '2024-08-22', 'DELIVERED');
+
+    -- ── Raw events (batch 2: IDs 9008-9015) ───────────────────────────────
+    INSERT INTO raw_events VALUES
+      (9008, 6,  'page_view',   'sess-ggg', '{"page":"/pricing"}',      '2024-07-01', 'APAC'),
+      (9009, 7,  'add_to_cart', 'sess-hhh', '{"product_id":107}',       '2024-07-08', 'AMER'),
+      (9010, 8,  'purchase',    'sess-iii', '{"order_id":1013}',        '2024-07-12', 'APAC'),
+      (9011, 9,  'page_view',   'sess-jjj', '{"page":"/products"}',     '2024-07-20', 'EMEA'),
+      (9012, 10, 'add_to_cart', 'sess-kkk', '{"product_id":101}',       '2024-07-25', 'AMER'),
+      (9013, 6,  'purchase',    'sess-lll', '{"order_id":1016}',        '2024-08-01', 'APAC'),
+      (9014, 7,  'refund',      'sess-mmm', '{"order_id":1012}',        '2024-08-05', 'AMER'),
+      (9015, 8,  'purchase',    'sess-nnn', '{"order_id":1018}',        '2024-08-10', 'APAC');
+
+    SELECT 'AFTER — customers'  AS label, COUNT(*) AS rows FROM customers;
+    SELECT 'AFTER — products'   AS label, COUNT(*) AS rows FROM products;
+    SELECT 'AFTER — orders'     AS label, COUNT(*) AS rows FROM orders;
+    SELECT 'AFTER — raw_events' AS label, COUNT(*) AS rows FROM raw_events;
+
+---
+# ── Job ───────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-insert-more
+  labels:
+    app: spark-insert-more
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: fetch-jars
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mc alias set m http://minio.secureagent.svc.cluster.local:9000 admin password
+              mc cp m/poc/hadoop-aws-3.3.4.jar          /extra-jars/hadoop-aws.jar
+              mc cp m/poc/aws-java-sdk-bundle-1.12.367.jar /extra-jars/aws-java-sdk-bundle.jar
+              echo "==> JARs ready: $(ls -lh /extra-jars/)"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+      containers:
+        - name: spark-sql
+          image: apache/spark:3.5.1
+          resources:
+            requests:
+              memory: "1.5Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "══════════════════════════════════════════════════════════"
+              echo " Operational batch-2 insert — Write path:"
+              echo ""
+              echo "  Spark SQL → spark_catalog (catalogImplementation=hive)"
+              echo "           → HMS A  thrift://hive-metastore-a:9083"
+              echo "           → MinIO  s3a://hive-operational/warehouse/"
+              echo "══════════════════════════════════════════════════════════"
+
+              JARS=$(ls /extra-jars/*.jar | tr '\n' ':' | sed 's/:$//')
+
+              /opt/spark/bin/spark-sql \
+                --master local[2] \
+                --conf "spark.driver.extraClassPath=$JARS" \
+                --conf "spark.sql.catalogImplementation=hive" \
+                --conf "spark.hadoop.hive.metastore.uris=thrift://hive-metastore-a:9083" \
+                --conf "spark.hadoop.hive.metastore.warehouse.dir=s3a://hive-operational/warehouse" \
+                --conf "spark.driver.memory=1g" \
+                --conf "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem" \
+                --conf "spark.hadoop.fs.AbstractFileSystem.s3a.impl=org.apache.hadoop.fs.s3a.S3A" \
+                --conf "spark.hadoop.fs.s3a.endpoint=http://minio.secureagent.svc.cluster.local:9000" \
+                --conf "spark.hadoop.fs.s3a.access.key=admin" \
+                --conf "spark.hadoop.fs.s3a.secret.key=password" \
+                --conf "spark.hadoop.fs.s3a.path.style.access=true" \
+                --conf "spark.hadoop.fs.s3a.connection.ssl.enabled=false" \
+                -f /tmp/insert-more.sql
+
+              echo ""
+              echo "══════════════════════════════════════════════════════════"
+              echo " Batch-2 inserts complete."
+              echo ""
+              echo " Verify via Gravitino UI http://localhost:30329:"
+              echo "   demo > hive_operational > operational_db"
+              echo "   All 4 tables now have higher row counts."
+              echo "══════════════════════════════════════════════════════════"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: sql-scripts
+              mountPath: /tmp/insert-more.sql
+              subPath: insert-more.sql
+
+      volumes:
+        - name: extra-jars
+          emptyDir: {}
+        - name: sql-scripts
+          configMap:
+            name: spark-insert-more-sql

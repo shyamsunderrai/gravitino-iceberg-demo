@@ -1,0 +1,22 @@
+# JAR binaries — download with: bash scripts/00-download-jars.sh
+jars/*.jar
+temp/
+
+# macOS
+.DS_Store
+
+# Temp files created by demo scripts
+/tmp/gravitino-*.py
+/tmp/gravitino-*.json
+
+# Claude Code local settings
+.claude/
+
+# Legacy top-level scripts (superseded by scripts/ directory)
+ac_write_demo.sh
+cleanup.sh
+iceberg_write_demo.sh
+oc_write_demo.sh
+register_iceberg_catalog.sh
+gravitino-data-pvc.yaml
+gravitino-iceberg-s3-values.yaml

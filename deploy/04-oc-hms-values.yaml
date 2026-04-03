@@ -1,0 +1,42 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Operational Hive Metastore (OC-HMS) values
+#
+# Usage:
+#   helm install hive-metastore ./charts/hive-metastore -n gravitino \
+#     -f deploy/04-oc-hms-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+hive:
+  thriftPort: 9083
+  warehouseDir: "s3a://operational/warehouse"
+
+# SeaweedFS S3 as the object store backend (operational bucket)
+minio:
+  accessKey: admin
+  secretKey: admin
+  endpoint: "http://seaweedfs-filer.gravitino.svc.cluster.local:8333"
+  bucket: operational
+  pathStyleAccess: "true"
+  sslEnabled: "false"
+
+mysql:
+  database: hive_metastore
+  username: hive
+  password: changeme
+  rootPassword: hiveroot
+  image:
+    registry: docker.io
+    repository: mysql
+    tag: "8.4.8-oracle"
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+
+# NodePort 30983 allows external access for debugging (e.g. Beeline)
+service:
+  type: NodePort
+  port: 9083
+  nodePort: 30983

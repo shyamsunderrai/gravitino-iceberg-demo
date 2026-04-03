@@ -1,0 +1,267 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Creates sample databases and tables in Hive Metastore A (operational).
+#
+# Apply AFTER setup-catalogs-job.yaml has succeeded:
+#   kubectl apply -f create-dummy-data-job.yaml
+#   kubectl logs -f job/hive-demo-create-tables
+#
+# What this does:
+#   1. Creates database  operational_db
+#   2. Creates tables    customers, orders, products, raw_events (partitioned)
+#   3. All tables point to s3a://hive-operational/warehouse/ locations in MinIO
+#
+# After this Job completes, open Gravitino UI and browse:
+#   demo > hive_operational > operational_db
+# The same objects will NOT appear in hive_analytical — demonstrating that
+# Gravitino federates independent metastores without synchronisation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ConfigMap: SQL script ─────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hive-demo-ddl
+  labels:
+    app: hive-demo-create-tables
+data:
+  create-tables.sql: |
+    -- ── Database ──────────────────────────────────────────────────────────────
+    CREATE DATABASE IF NOT EXISTS operational_db
+      COMMENT 'Operational data — source of truth for production objects'
+      LOCATION 's3a://hive-operational/warehouse/operational_db.db'
+      WITH DBPROPERTIES (
+        'team'  = 'platform',
+        'env'   = 'operational',
+        'owner' = 'data-engineering'
+      );
+
+    USE operational_db;
+
+    -- ── Customers dimension ──────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS customers (
+      customer_id  BIGINT   COMMENT 'Surrogate key',
+      name         STRING   COMMENT 'Full name',
+      email        STRING   COMMENT 'Primary contact email',
+      region       STRING   COMMENT 'Geographic region: AMER | EMEA | APAC',
+      tier         STRING   COMMENT 'Contract tier: STANDARD | PREMIUM | ENTERPRISE',
+      signup_date  STRING   COMMENT 'ISO-8601 registration date'
+    )
+    COMMENT 'Customer dimension — one row per customer'
+    STORED AS PARQUET
+    LOCATION 's3a://hive-operational/warehouse/operational_db.db/customers';
+
+    -- ── Products catalogue ───────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS products (
+      product_id  BIGINT   COMMENT 'Surrogate key',
+      name        STRING   COMMENT 'Display name',
+      category    STRING   COMMENT 'Top-level category',
+      sub_category STRING  COMMENT 'Sub-category',
+      list_price  DOUBLE   COMMENT 'Published price in USD',
+      is_active   BOOLEAN  COMMENT 'Whether currently offered'
+    )
+    COMMENT 'Product catalogue — one row per SKU'
+    STORED AS PARQUET
+    LOCATION 's3a://hive-operational/warehouse/operational_db.db/products';
+
+    -- ── Orders fact table ────────────────────────────────────────────────────
+    CREATE TABLE IF NOT EXISTS orders (
+      order_id    BIGINT  COMMENT 'Surrogate key',
+      customer_id BIGINT  COMMENT 'FK → customers.customer_id',
+      product_id  BIGINT  COMMENT 'FK → products.product_id',
+      quantity    INT     COMMENT 'Units ordered',
+      unit_price  DOUBLE  COMMENT 'Price at time of order in USD',
+      order_date  STRING  COMMENT 'ISO-8601 order date',
+      status      STRING  COMMENT 'PENDING | SHIPPED | DELIVERED | CANCELLED'
+    )
+    COMMENT 'Orders fact table — one row per line item'
+    STORED AS PARQUET
+    LOCATION 's3a://hive-operational/warehouse/operational_db.db/orders';
+
+    -- ── Raw events (partitioned) ─────────────────────────────────────────────
+    -- Demonstrates partition pruning; analytical users can replicate only
+    -- the partitions they care about via Gravitino.
+    CREATE TABLE IF NOT EXISTS raw_events (
+      event_id    BIGINT  COMMENT 'Unique event identifier',
+      customer_id BIGINT  COMMENT 'FK → customers.customer_id',
+      event_type  STRING  COMMENT 'page_view | add_to_cart | purchase | refund',
+      session_id  STRING  COMMENT 'Browser / app session identifier',
+      payload     STRING  COMMENT 'JSON blob with event-specific attributes'
+    )
+    COMMENT 'Raw clickstream / behavioural events — partitioned by date and region'
+    PARTITIONED BY (
+      event_date STRING COMMENT 'ISO-8601 date partition key',
+      region     STRING COMMENT 'Geographic region partition key'
+    )
+    STORED AS PARQUET
+    LOCATION 's3a://hive-operational/warehouse/operational_db.db/raw_events';
+
+    -- ── Verify ───────────────────────────────────────────────────────────────
+    SHOW DATABASES;
+    SHOW TABLES IN operational_db;
+
+  # Hive configuration pointing at HMS A
+  hive-site.xml: |
+    <?xml version="1.0" encoding="UTF-8" standalone="no"?>
+    <configuration>
+      <property>
+        <name>hive.metastore.uris</name>
+        <value>thrift://hive-metastore-a:9083</value>
+      </property>
+      <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>s3a://hive-operational/warehouse</value>
+      </property>
+      <!-- Redirect CLI scratch dir to local filesystem (no HDFS in this env) -->
+      <property>
+        <name>hive.exec.scratchdir</name>
+        <value>/tmp/hive-scratch</value>
+      </property>
+      <property>
+        <name>hive.exec.local.scratchdir</name>
+        <value>/tmp/hive-local</value>
+      </property>
+    </configuration>
+
+  # Hadoop S3A → MinIO
+  # fs.defaultFS is set to file:/// so the Hive CLI scratch dir uses local
+  # filesystem instead of trying to reach a non-existent HDFS cluster.
+  core-site.xml: |
+    <?xml version="1.0" encoding="UTF-8"?>
+    <configuration>
+      <!-- Use local FS as default; avoids Hive CLI looking for HDFS scratch dir -->
+      <property>
+        <name>fs.defaultFS</name>
+        <value>file:///</value>
+      </property>
+      <property>
+        <name>fs.s3a.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
+      </property>
+      <property>
+        <name>fs.AbstractFileSystem.s3a.impl</name>
+        <value>org.apache.hadoop.fs.s3a.S3A</value>
+      </property>
+      <property>
+        <name>fs.s3a.endpoint</name>
+        <value>http://minio.secureagent.svc.cluster.local:9000</value>
+      </property>
+      <property>
+        <name>fs.s3a.access.key</name>
+        <value>admin</value>
+      </property>
+      <property>
+        <name>fs.s3a.secret.key</name>
+        <value>password</value>
+      </property>
+      <property>
+        <name>fs.s3a.path.style.access</name>
+        <value>true</value>
+      </property>
+      <property>
+        <name>fs.s3a.connection.ssl.enabled</name>
+        <value>false</value>
+      </property>
+    </configuration>
+
+---
+# ── Job ───────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hive-demo-create-tables
+  labels:
+    app: hive-demo-create-tables
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        # Download MySQL connector (schematool / Hive CLI needs it even as a
+        # remote client because HMS connection validation touches the driver).
+        - name: download-mysql-connector
+          image: curlimages/curl:8.5.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              curl -fSL \
+                "https://repo1.maven.org/maven2/mysql/mysql-connector-java/8.0.28/mysql-connector-java-8.0.28.jar" \
+                -o /extra-jars/mysql-connector-java-8.0.28.jar
+              echo "Downloaded: $(ls -lh /extra-jars/)"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+      containers:
+        - name: hive-cli
+          image: apache/hive:3.1.3
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              HADOOP_HOME="${HADOOP_HOME:-/opt/hadoop}"
+
+              # Use HIVE_AUX_JARS_PATH so the connector is added to the
+              # classpath without needing write access to /opt/hive/lib/
+              export HIVE_AUX_JARS_PATH="/extra-jars"
+              export HADOOP_CLASSPATH="${HADOOP_HOME}/share/hadoop/tools/lib/*"
+              export HADOOP_CONF_DIR="/tmp/conf"
+              export HIVE_CONF_DIR="/tmp/conf"
+
+              echo "==> Running DDL against HMS A..."
+              "${HIVE_HOME}/bin/hive" -f /tmp/conf/create-tables.sql
+
+              echo ""
+              echo "════════════════════════════════════════════════════════"
+              echo " Tables created in hive_operational (HMS A)!"
+              echo ""
+              echo " Verify in Gravitino UI:"
+              echo "   demo > hive_operational > operational_db"
+              echo ""
+              echo " Tables:"
+              echo "   customers   — dimension"
+              echo "   products    — dimension"
+              echo "   orders      — fact"
+              echo "   raw_events  — partitioned fact"
+              echo ""
+              echo " Data locations (MinIO bucket: hive-operational):"
+              echo "   s3a://hive-operational/warehouse/operational_db.db/"
+              echo "════════════════════════════════════════════════════════"
+          env:
+            - name: HIVE_HOME
+              value: /opt/hive
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: hive-conf
+              mountPath: /tmp/conf
+
+      volumes:
+        - name: extra-jars
+          emptyDir: {}
+        - name: hive-conf
+          configMap:
+            name: hive-demo-ddl
+            defaultMode: 0755

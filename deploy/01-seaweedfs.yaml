@@ -1,0 +1,241 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# SeaweedFS – single-file all-in-one manifest
+#
+# Deploys:
+#   - seaweedfs-master  (metadata server, port 9333)
+#   - seaweedfs-volume  (data node, port 8080)
+#   - seaweedfs-filer   (file API + S3 gateway on port 8333)
+#
+# Exposed externally:
+#   - NodePort 30333 → SeaweedFS Master UI  (http://localhost:30333)
+#   - NodePort 30334 → SeaweedFS S3 API     (http://localhost:30334)
+# ──────────────────────────────────────────────────────────────────────────────
+---
+# PVC: Master metadata storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-master-pvc
+  namespace: gravitino
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 1Gi
+---
+# PVC: Volume server data storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-volume-pvc
+  namespace: gravitino
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 5Gi
+---
+# PVC: Filer metadata storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: seaweedfs-filer-pvc
+  namespace: gravitino
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 2Gi
+---
+# Deployment: Master
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-master
+  namespace: gravitino
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs-master
+  template:
+    metadata:
+      labels:
+        app: seaweedfs-master
+    spec:
+      containers:
+        - name: master
+          image: chrislusf/seaweedfs:dev
+          imagePullPolicy: IfNotPresent
+          args: [master, -port=9333, -mdir=/data]
+          ports:
+            - name: http
+              containerPort: 9333
+            - name: grpc
+              containerPort: 19333
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: seaweedfs-master-pvc
+---
+# Deployment: Volume server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-volume
+  namespace: gravitino
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs-volume
+  template:
+    metadata:
+      labels:
+        app: seaweedfs-volume
+    spec:
+      containers:
+        - name: volume
+          image: chrislusf/seaweedfs:dev
+          imagePullPolicy: IfNotPresent
+          args: [volume, -mserver=seaweedfs-master:9333, -port=8080, -dir=/data]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 18080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: seaweedfs-volume-pvc
+---
+# Deployment: Filer (with S3 gateway)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs-filer
+  namespace: gravitino
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs-filer
+  template:
+    metadata:
+      labels:
+        app: seaweedfs-filer
+    spec:
+      containers:
+        - name: filer
+          image: chrislusf/seaweedfs:dev
+          imagePullPolicy: IfNotPresent
+          args: [filer, -master=seaweedfs-master:9333, -port=8888, -s3, -s3.port=8333]
+          ports:
+            - name: http
+              containerPort: 8888
+            - name: grpc
+              containerPort: 18888
+            - name: s3
+              containerPort: 8333
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: seaweedfs-filer-pvc
+---
+# Service: Master (cluster-internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-master
+  namespace: gravitino
+spec:
+  selector:
+    app: seaweedfs-master
+  ports:
+    - name: http
+      port: 9333
+      targetPort: 9333
+    - name: grpc
+      port: 19333
+      targetPort: 19333
+---
+# Service: Master UI (NodePort – browse http://localhost:30333)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-master-ui
+  namespace: gravitino
+spec:
+  type: NodePort
+  selector:
+    app: seaweedfs-master
+  ports:
+    - name: http
+      port: 9333
+      targetPort: 9333
+      nodePort: 30333
+---
+# Service: Filer (cluster-internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-filer
+  namespace: gravitino
+spec:
+  selector:
+    app: seaweedfs-filer
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+    - name: grpc
+      port: 18888
+      targetPort: 18888
+    - name: s3
+      port: 8333
+      targetPort: 8333
+---
+# Service: Volume (cluster-internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-volume
+  namespace: gravitino
+spec:
+  selector:
+    app: seaweedfs-volume
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 18080
+      targetPort: 18080
+---
+# Service: S3 API (NodePort – use http://localhost:30334 for aws CLI)
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs-s3
+  namespace: gravitino
+spec:
+  type: NodePort
+  selector:
+    app: seaweedfs-filer
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: 8333
+      nodePort: 30334

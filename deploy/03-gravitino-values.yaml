@@ -1,0 +1,39 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Gravitino Helm values for the Iceberg Federation Demo
+#
+# Usage:
+#   helm install gravitino ./charts/gravitino -n gravitino \
+#     -f deploy/03-gravitino-values.yaml
+# ──────────────────────────────────────────────────────────────────────────────
+
+image:
+  tag: "1.2.0"
+
+# Persist the H2 embedded database across pod restarts.
+# The PVC must be created first: kubectl apply -f deploy/02-gravitino-pvc.yaml
+persistence:
+  enabled: true
+  existingClaim: gravitino-data
+
+# Iceberg REST auxiliary service (port 9001)
+# Backed by the Operational Hive Metastore (OC-HMS) with data on SeaweedFS.
+icebergRest:
+  classpath: "iceberg-rest-server/libs, iceberg-rest-server/conf"
+  catalogBackend: hive
+  uri: "thrift://hive-metastore.gravitino.svc.cluster.local:9083"
+  warehouse: "s3a://operational/iceberg-warehouse"
+  ioImpl: org.apache.iceberg.aws.s3.S3FileIO
+  s3:
+    accessKeyId: admin
+    secretAccessKey: admin
+    endpoint: "http://seaweedfs-filer.gravitino.svc.cluster.local:8333"
+    pathStyleAccess: "true"
+    region: "us-east-1"
+
+extraVolumes:
+  - name: gravitino-log
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: gravitino-log
+    mountPath: /root/gravitino/logs

@@ -1,0 +1,370 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#  http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-catalog analytics demo via Gravitino federation — three-phase design.
+#
+# ── Phase 1: DISCOVER + REGISTER (Gravitino V2 catalog) ───────────────────────
+#
+#   Uses GravitinoSparkPlugin to show both HMS catalogs in one Spark session.
+#   Creates HMS B analytical database and four table schemas via Gravitino V2 DDL.
+#   No data is written in this phase — pure metadata federation.
+#
+#   Demo point:
+#     SHOW CATALOGS  → hive_operational + hive_analytical (both in one Spark session)
+#     SHOW TABLES IN hive_operational.operational_db  → 4 source tables (from HMS A)
+#     SHOW TABLES IN hive_analytical.analytical_db    → 4 registered tables (in HMS B)
+#
+# ── Phase 2: COMPUTE + WRITE (direct HMS A reads → hive-analytical S3A) ───────
+#
+#   Spark session points at HMS A directly (V1).  Computes aggregations across the
+#   four operational tables and writes Parquet files to the hive-analytical MinIO
+#   bucket using INSERT OVERWRITE DIRECTORY (S3A write path, no HMS B needed).
+#
+#   Write path:
+#     Spark SELECT FROM operational_db.*  →  HMS A thrift  →  Parquet at
+#       s3a://hive-operational/warehouse/operational_db.db/...  (read)
+#     Spark INSERT OVERWRITE DIRECTORY    →  Parquet written to
+#       s3a://hive-analytical/warehouse/analytical_db.db/...   (write)
+#
+# ── Phase 3: VERIFY (direct HMS B reads) ──────────────────────────────────────
+#
+#   Spark session points at HMS B directly (V1).  The HMS B tables registered in
+#   Phase 1 (via Gravitino) point to the S3A paths written in Phase 2.
+#   Proves: tables are real, durable HMS B entries readable by any Hive client.
+#
+# DEMO POINT:
+#   After this job:
+#     Gravitino UI (http://localhost:30329):
+#       demo > hive_analytical > analytical_db — 4 derived tables with data
+#       demo > hive_operational > operational_db — source tables unchanged
+#     MinIO hive-analytical bucket now contains Parquet files.
+#     HMS B tables are directly queryable — Gravitino writes durable catalog entries.
+#
+# PRE-REQUISITES:
+#   spark-write-demo-job.yaml completed (operational_db tables need data).
+#
+# Apply:
+#   kubectl apply -f spark-analytics-federated-job.yaml -n gravitino-demo
+#   kubectl logs -f job/spark-analytics-federated -n gravitino-demo -c spark-sql
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── ConfigMap: three SQL scripts ──────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-analytics-federated-sql
+  labels:
+    app: spark-analytics-federated
+data:
+  # ── Phase 1: discover via Gravitino + register HMS B schemas ─────────────
+  phase1-register.sql: |
+    -- ── Phase 1: Gravitino Federation — Discover + Register ──────────────
+    --
+    -- GravitinoSparkPlugin registers BOTH catalogs in one Spark session.
+    -- We show HMS A tables (discovery) then register HMS B table schemas.
+
+    SHOW CATALOGS;
+
+    -- Gravitino shows HMS A tables via hive_operational V2 catalog
+    SHOW TABLES IN hive_operational.operational_db;
+
+    -- HMS B state before this job
+    SHOW SCHEMAS IN hive_analytical;
+
+    -- ── Create analytical_db in HMS B via Gravitino V2 ────────────────────
+    CREATE DATABASE IF NOT EXISTS hive_analytical.analytical_db
+      COMMENT 'Analytical layer — derived from operational data via Gravitino';
+
+    -- ── Register 4 analytical table schemas in HMS B via Gravitino V2 ─────
+    -- No CTAS — schemas only.  Data will be written in Phase 2.
+
+    CREATE TABLE IF NOT EXISTS hive_analytical.analytical_db.regional_summary (
+      region           STRING  COMMENT 'Geographic region',
+      tier             STRING  COMMENT 'Contract tier',
+      customer_count   BIGINT  COMMENT 'Number of customers in this segment',
+      earliest_signup  STRING  COMMENT 'Earliest signup date in segment',
+      latest_signup    STRING  COMMENT 'Latest signup date in segment'
+    )
+    USING parquet
+    LOCATION 's3a://hive-analytical/warehouse/analytical_db.db/regional_summary'
+    COMMENT 'Regional customer breakdown derived from operational customers';
+
+    CREATE TABLE IF NOT EXISTS hive_analytical.analytical_db.product_revenue (
+      product_name   STRING  COMMENT 'Product display name',
+      category       STRING  COMMENT 'Top-level product category',
+      sub_category   STRING  COMMENT 'Sub-category',
+      order_count    BIGINT  COMMENT 'Number of orders',
+      total_units    BIGINT  COMMENT 'Units sold',
+      total_revenue  DOUBLE  COMMENT 'Total revenue (USD)'
+    )
+    USING parquet
+    LOCATION 's3a://hive-analytical/warehouse/analytical_db.db/product_revenue'
+    COMMENT 'Revenue by product derived from operational orders + products JOIN';
+
+    CREATE TABLE IF NOT EXISTS hive_analytical.analytical_db.customer_ltv (
+      customer_id     BIGINT  COMMENT 'Customer surrogate key',
+      customer_name   STRING  COMMENT 'Customer full name',
+      region          STRING  COMMENT 'Geographic region',
+      tier            STRING  COMMENT 'Contract tier',
+      total_orders    BIGINT  COMMENT 'Total delivered/shipped orders',
+      lifetime_value  DOUBLE  COMMENT 'Lifetime revenue (USD)',
+      last_order_date STRING  COMMENT 'Date of most recent order'
+    )
+    USING parquet
+    LOCATION 's3a://hive-analytical/warehouse/analytical_db.db/customer_ltv'
+    COMMENT 'Customer lifetime value derived from operational customers + orders';
+
+    CREATE TABLE IF NOT EXISTS hive_analytical.analytical_db.event_funnel (
+      region       STRING  COMMENT 'Geographic region',
+      event_type   STRING  COMMENT 'Event type: page_view | add_to_cart | purchase | refund',
+      event_count  BIGINT  COMMENT 'Total events',
+      unique_users BIGINT  COMMENT 'Distinct customers generating these events'
+    )
+    USING parquet
+    LOCATION 's3a://hive-analytical/warehouse/analytical_db.db/event_funnel'
+    COMMENT 'Event funnel by region derived from operational raw_events';
+
+    -- Gravitino now sees all 4 schemas registered in HMS B
+    SHOW TABLES IN hive_analytical.analytical_db;
+
+  # ── Phase 2: compute + write to hive-analytical S3A paths ────────────────
+  phase2-compute.sql: |
+    -- ── Phase 2: Compute Aggregations — Direct HMS A Reads ───────────────
+    --
+    -- Direct V1 connection to HMS A.  Computes 4 analytical aggregations and
+    -- writes Parquet to the hive-analytical S3A locations registered in Phase 1.
+    -- INSERT OVERWRITE DIRECTORY writes Parquet directly to S3A (no HMS B needed).
+
+    -- ── regional_summary ──────────────────────────────────────────────────
+    INSERT OVERWRITE DIRECTORY 's3a://hive-analytical/warehouse/analytical_db.db/regional_summary'
+    USING parquet
+    SELECT
+      region,
+      tier,
+      COUNT(*)          AS customer_count,
+      MIN(signup_date)  AS earliest_signup,
+      MAX(signup_date)  AS latest_signup
+    FROM operational_db.customers
+    GROUP BY region, tier
+    ORDER BY region, tier;
+
+    -- ── product_revenue ───────────────────────────────────────────────────
+    INSERT OVERWRITE DIRECTORY 's3a://hive-analytical/warehouse/analytical_db.db/product_revenue'
+    USING parquet
+    SELECT
+      p.name                                    AS product_name,
+      p.category,
+      p.sub_category,
+      COUNT(o.order_id)                         AS order_count,
+      SUM(o.quantity)                           AS total_units,
+      ROUND(SUM(o.quantity * o.unit_price), 2)  AS total_revenue
+    FROM operational_db.orders   o
+    JOIN operational_db.products p ON o.product_id = p.product_id
+    WHERE o.status != 'CANCELLED'
+    GROUP BY p.name, p.category, p.sub_category
+    ORDER BY total_revenue DESC;
+
+    -- ── customer_ltv ──────────────────────────────────────────────────────
+    INSERT OVERWRITE DIRECTORY 's3a://hive-analytical/warehouse/analytical_db.db/customer_ltv'
+    USING parquet
+    SELECT
+      c.customer_id,
+      c.name                                    AS customer_name,
+      c.region,
+      c.tier,
+      COALESCE(COUNT(o.order_id), 0)            AS total_orders,
+      COALESCE(ROUND(SUM(o.quantity * o.unit_price), 2), 0.0) AS lifetime_value,
+      MAX(o.order_date)                         AS last_order_date
+    FROM operational_db.customers c
+    LEFT JOIN operational_db.orders o
+      ON c.customer_id = o.customer_id
+     AND o.status IN ('DELIVERED', 'SHIPPED')
+    GROUP BY c.customer_id, c.name, c.region, c.tier
+    ORDER BY lifetime_value DESC;
+
+    -- ── event_funnel ──────────────────────────────────────────────────────
+    INSERT OVERWRITE DIRECTORY 's3a://hive-analytical/warehouse/analytical_db.db/event_funnel'
+    USING parquet
+    SELECT
+      region,
+      event_type,
+      COUNT(*)                    AS event_count,
+      COUNT(DISTINCT customer_id) AS unique_users
+    FROM operational_db.raw_events
+    GROUP BY region, event_type
+    ORDER BY region, event_type;
+
+  # ── Phase 3: verify via direct HMS B reads ────────────────────────────────
+  phase3-verify.sql: |
+    -- ── Phase 3: Verify — Direct HMS B ───────────────────────────────────
+    --
+    -- HMS B tables registered via Gravitino (Phase 1) now point to Parquet
+    -- data written in Phase 2.  This proves Gravitino metadata is durable
+    -- and the tables are queryable by any Hive-compatible client.
+
+    USE analytical_db;
+    SHOW TABLES;
+
+    SELECT 'regional_summary' AS tbl, COUNT(*) AS rows FROM regional_summary;
+    SELECT * FROM regional_summary;
+
+    SELECT 'product_revenue' AS tbl, COUNT(*) AS rows FROM product_revenue;
+    SELECT * FROM product_revenue;
+
+    SELECT 'customer_ltv' AS tbl, COUNT(*) AS rows FROM customer_ltv;
+    SELECT customer_name, region, tier, total_orders, lifetime_value
+    FROM customer_ltv ORDER BY lifetime_value DESC LIMIT 5;
+
+    SELECT 'event_funnel' AS tbl, COUNT(*) AS rows FROM event_funnel;
+    SELECT * FROM event_funnel;
+
+---
+# ── Job ───────────────────────────────────────────────────────────────────────
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spark-analytics-federated
+  labels:
+    app: spark-analytics-federated
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: fetch-jars
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mc alias set m http://minio.secureagent.svc.cluster.local:9000 admin password
+              mc cp m/poc/gravitino-spark-connector-runtime-3.5_2.12-1.2.0.jar /extra-jars/gravitino-spark-connector-runtime.jar
+              mc cp m/poc/hadoop-aws-3.3.4.jar                                 /extra-jars/hadoop-aws.jar
+              mc cp m/poc/aws-java-sdk-bundle-1.12.367.jar                     /extra-jars/aws-java-sdk-bundle.jar
+              echo "==> JARs ready: $(ls -lh /extra-jars/)"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+
+      containers:
+        - name: spark-sql
+          image: apache/spark:3.5.1
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "3Gi"
+              cpu: "1"
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "══════════════════════════════════════════════════════════"
+              echo " Gravitino Cross-Catalog Analytics — 3-phase demo"
+              echo ""
+              echo "  Phase 1  Gravitino V2: SHOW + CREATE schemas in HMS B"
+              echo "  Phase 2  Direct HMS A: compute JOINs, write to hive-analytical S3A"
+              echo "  Phase 3  Direct HMS B: verify tables registered via Gravitino"
+              echo "══════════════════════════════════════════════════════════"
+
+              JARS=$(ls /extra-jars/*.jar | tr '\n' ':' | sed 's/:$//')
+
+              S3A="--conf spark.driver.extraClassPath=${JARS}
+                   --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+                   --conf spark.hadoop.fs.AbstractFileSystem.s3a.impl=org.apache.hadoop.fs.s3a.S3A
+                   --conf spark.hadoop.fs.s3a.endpoint=http://minio.secureagent.svc.cluster.local:9000
+                   --conf spark.hadoop.fs.s3a.access.key=admin
+                   --conf spark.hadoop.fs.s3a.secret.key=password
+                   --conf spark.hadoop.fs.s3a.path.style.access=true
+                   --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+                   --conf spark.driver.memory=1g"
+
+              # ── Phase 1: Gravitino — discover + register HMS B schemas ────
+              echo ""
+              echo "══ Phase 1: Gravitino discovery + HMS B schema registration ═"
+              /opt/spark/bin/spark-sql --master local[2] \
+                $(echo $S3A) \
+                --conf "spark.plugins=org.apache.gravitino.spark.connector.plugin.GravitinoSparkPlugin" \
+                --conf "spark.sql.gravitino.uri=http://gravitino:8090" \
+                --conf "spark.sql.gravitino.metalake=demo" \
+                --conf "spark.sql.defaultCatalog=hive_analytical" \
+                --conf "spark.sql.catalogImplementation=hive" \
+                --conf "spark.hadoop.hive.metastore.uris=thrift://hive-metastore-a:9083" \
+                --conf "spark.hadoop.hive.metastore.warehouse.dir=s3a://hive-operational/warehouse" \
+                -f /tmp/phase1-register.sql
+
+              # ── Phase 2: Direct HMS A — compute + write to hive-analytical ─
+              echo ""
+              echo "══ Phase 2: Compute aggregations + write to hive-analytical ═"
+              /opt/spark/bin/spark-sql --master local[2] \
+                $(echo $S3A) \
+                --conf "spark.sql.catalogImplementation=hive" \
+                --conf "spark.hadoop.hive.metastore.uris=thrift://hive-metastore-a:9083" \
+                --conf "spark.hadoop.hive.metastore.warehouse.dir=s3a://hive-operational/warehouse" \
+                -f /tmp/phase2-compute.sql
+
+              # ── Phase 3: Direct HMS B — verify tables have data ────────────
+              echo ""
+              echo "══ Phase 3: Verify via direct HMS B query ═══════════════════"
+              /opt/spark/bin/spark-sql --master local[2] \
+                $(echo $S3A) \
+                --conf "spark.sql.catalogImplementation=hive" \
+                --conf "spark.hadoop.hive.metastore.uris=thrift://hive-metastore-b:9083" \
+                --conf "spark.hadoop.hive.metastore.warehouse.dir=s3a://hive-analytical/warehouse" \
+                -f /tmp/phase3-verify.sql
+
+              echo ""
+              echo "══════════════════════════════════════════════════════════"
+              echo " Analytics demo complete!"
+              echo ""
+              echo " Gravitino UI  http://localhost:30329"
+              echo "   demo > hive_analytical > analytical_db — 4 derived tables"
+              echo "   demo > hive_operational > operational_db — unchanged source"
+              echo ""
+              echo " MinIO hive-analytical bucket:"
+              echo "   warehouse/analytical_db.db/regional_summary/  (Parquet)"
+              echo "   warehouse/analytical_db.db/product_revenue/   (Parquet)"
+              echo "   warehouse/analytical_db.db/customer_ltv/      (Parquet)"
+              echo "   warehouse/analytical_db.db/event_funnel/      (Parquet)"
+              echo "══════════════════════════════════════════════════════════"
+          volumeMounts:
+            - name: extra-jars
+              mountPath: /extra-jars
+            - name: sql-scripts
+              mountPath: /tmp/phase1-register.sql
+              subPath: phase1-register.sql
+            - name: sql-scripts
+              mountPath: /tmp/phase2-compute.sql
+              subPath: phase2-compute.sql
+            - name: sql-scripts
+              mountPath: /tmp/phase3-verify.sql
+              subPath: phase3-verify.sql
+
+      volumes:
+        - name: extra-jars
+          emptyDir: {}
+        - name: sql-scripts
+          configMap:
+            name: spark-analytics-federated-sql
