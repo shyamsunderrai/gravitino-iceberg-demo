@@ -1,0 +1,212 @@
+################################################################################
+# deploy/08-network-policy.yaml
+#
+# Kubernetes NetworkPolicy — preventing direct HMS bypass
+#
+# WHAT THIS FILE DEPLOYS:
+#   1. NetworkPolicy: allow-gravitino-to-oc-hms   — OC-HMS only accepts traffic
+#                                                    from pods labelled app=gravitino
+#   2. NetworkPolicy: allow-gravitino-to-ac-hms   — AC-HMS accepts traffic from
+#                                                    app=gravitino AND app=spire-agent-ac
+#   3. NetworkPolicy: deny-all-to-oc-hms          — default deny for OC-HMS
+#   4. NetworkPolicy: deny-all-to-ac-hms          — default deny for AC-HMS
+#
+# WHY THIS IS THE CRITICAL ENFORCEMENT LAYER:
+#
+#   Without NetworkPolicy, a rogue pod (or an authorized Spark pod going rogue)
+#   can open a Thrift connection directly to HMS on port 9083 and:
+#     • Read all table metadata
+#     • Create tables
+#     • Drop tables
+#     • Alter table schemas
+#   ...completely bypassing Gravitino's RBAC and any SPIFFE authentication.
+#
+#   NetworkPolicy is enforced at the kernel level by the CNI (Container Network
+#   Interface) plugin (Calico, Cilium, etc.). Kubernetes network policies use
+#   iptables/eBPF rules — they cannot be bypassed from within a pod.
+#
+#   The enforcement model:
+#     • OC-HMS (operational): ONLY Gravitino can reach port 9083
+#       → Spark cannot write to OC-HMS directly. It MUST go through Gravitino.
+#       → Gravitino enforces RBAC: only oc_writer role can write to oc_iceberg.
+#
+#     • AC-HMS (analytical): Gravitino + AC-HMS Spark writer (with SPIFFE ID)
+#       → The ac_write_demo Spark job writes directly to AC-HMS.
+#       → But Gravitino's RBAC prevents ac_writer from touching OC catalogs.
+#
+#   HOW SPIFFE FITS IN:
+#     NetworkPolicy enforces WHICH pods can talk to HMS (pod-label based).
+#     SPIFFE enforces WHO those pods are and WHAT they're authorized to do.
+#     Both layers are needed — NetworkPolicy alone doesn't tell you if the
+#     caller has a valid identity; SPIFFE alone doesn't prevent a pod from
+#     opening a raw TCP connection to HMS.
+#
+# IMPORTANT: NetworkPolicy requires a CNI that supports it.
+#   • Docker Desktop Kubernetes: uses kindnet, which does NOT enforce NetworkPolicy
+#     (policies are accepted by the API server but silently ignored by kindnet)
+#   • For real enforcement use: Calico, Cilium, or Weave Net
+#   • In Docker Desktop, the policies are still valuable as documentation and
+#     will enforce correctly when you move to a real cluster (EKS, GKE, AKS)
+#
+#   To test enforcement on Docker Desktop, you can install Calico:
+#     kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+#
+#   NOTE: We also patch the HMS Services from NodePort to ClusterIP below.
+#   NodePort exposes HMS on the node's external IP — defeating NetworkPolicy
+#   (traffic arriving at the NodePort bypasses pod-level policy). ClusterIP
+#   confines access to within the cluster.
+################################################################################
+
+---
+# ── NetworkPolicy: default deny all ingress to OC-HMS ─────────────────────────
+# This is the "default deny" rule. By default Kubernetes allows all pod-to-pod
+# traffic. This policy selects the OC-HMS pod (app=hive-metastore, role=operational)
+# and denies ALL ingress that doesn't match a subsequent allow rule.
+#
+# The combination of a default-deny + explicit-allow is best practice:
+# it means new pods or new services can't accidentally reach HMS — you must
+# explicitly add an allow rule for each authorized caller.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-to-oc-hms
+  namespace: gravitino
+spec:
+  podSelector:
+    matchLabels:
+      # These labels must match what the OC-HMS helm chart sets on its pods.
+      # The hive-metastore helm chart sets app.kubernetes.io/name=hive-metastore.
+      # We'll also label the pod with role=operational in the HMS values.
+      app.kubernetes.io/name: hive-metastore
+      role: operational
+  policyTypes:
+    - Ingress
+  ingress: []   # Empty ingress = deny all (overridden by the allow rule below)
+
+---
+# ── NetworkPolicy: ONLY Gravitino can reach OC-HMS on port 9083 ──────────────
+# This is the cornerstone of our security architecture.
+#
+# Gravitino is the ONLY service in the cluster authorized to speak Thrift to
+# OC-HMS. When Gravitino receives a request (authenticated via SPIFFE JWT),
+# it checks RBAC, and only if the caller has oc_writer_role does it forward
+# the Thrift operation to OC-HMS.
+#
+# Any other pod — including Spark pods — trying to reach OC-HMS port 9083
+# will get a TCP connection refused (or no response) from the kernel.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gravitino-to-oc-hms
+  namespace: gravitino
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hive-metastore
+      role: operational
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              # The Gravitino pod has label app=gravitino (set by the Helm chart).
+              # Only pods with this exact label can reach OC-HMS.
+              app.kubernetes.io/name: gravitino
+      ports:
+        - port: 9083
+          protocol: TCP
+
+---
+# ── NetworkPolicy: default deny all ingress to AC-HMS ─────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-to-ac-hms
+  namespace: gravitino
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hive-metastore
+      role: analytical
+  policyTypes:
+    - Ingress
+  ingress: []
+
+---
+# ── NetworkPolicy: Gravitino + authorized Spark pods can reach AC-HMS ─────────
+# AC-HMS has a different security model from OC-HMS:
+#   • Gravitino can reach it (for catalog metadata operations)
+#   • The ac_write_demo Spark job writes DIRECTLY to AC-HMS via Iceberg Hive
+#     catalog (not through Gravitino's REST). This is by design — the demo
+#     shows that analytical ETL can write directly to the analytical tier.
+#
+# The ac_write Spark pod is authorized to reach AC-HMS because:
+#   1. NetworkPolicy allows pods labelled spiffe-workload=spark-ac-writer
+#   2. SPIRE issues the pod a JWT-SVID: spiffe://gravitino.demo/spark-ac-writer
+#   3. That SPIFFE ID maps to ac_writer_role in Gravitino (for Gravitino ops)
+#   4. The pod connects to AC-HMS Thrift directly (authorized by NetworkPolicy)
+#
+# The oc_write Spark pod (spiffe-workload=spark-oc-writer) is NOT in this
+# allowFrom list — so it CANNOT reach AC-HMS even if it tries.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-to-ac-hms
+  namespace: gravitino
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hive-metastore
+      role: analytical
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gravitino
+      ports:
+        - port: 9083
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              # The ac_write_demo Spark pod gets this label so NetworkPolicy
+              # permits its direct connection to AC-HMS.
+              spiffe-workload: spark-ac-writer
+      ports:
+        - port: 9083
+          protocol: TCP
+
+---
+# ── IMPORTANT: Patch HMS Services to ClusterIP ────────────────────────────────
+# The HMS values files (04-oc-hms-values.yaml, 05-ac-hms-values.yaml) currently
+# set service.type=NodePort, which exposes HMS on the node's external IP.
+# Traffic arriving at the NodePort bypasses pod-level NetworkPolicy enforcement
+# because the traffic enters via kube-proxy, not directly pod-to-pod.
+#
+# Solution: change service type to ClusterIP so HMS is only reachable from
+# within the cluster, where NetworkPolicy is enforced.
+#
+# These are PATCHes to the existing Services (applied with kubectl patch),
+# not new resources. The setup script (06-setup-spire.sh) handles this.
+#
+# For reference, the target state of both HMS services:
+#
+#   OC-HMS service (hive-metastore):
+#     type: ClusterIP  (was NodePort 30983)
+#
+#   AC-HMS service (hive-metastore-analytics):
+#     type: ClusterIP  (was NodePort 30984)
+#
+# After patching, kubectl port-forward is the way to access HMS locally:
+#   kubectl port-forward svc/hive-metastore 9083:9083 -n gravitino
+#   kubectl port-forward svc/hive-metastore-analytics 9084:9083 -n gravitino
+#
+# (The setup script 06-setup-spire.sh will apply these patches automatically.)
+################################################################################
+
+# No additional YAML resources here — the Service patches are done
+# imperatively in scripts/06-setup-spire.sh because kubectl patch
+# is cleaner than a full Service override for in-place changes.

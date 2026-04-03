@@ -1,0 +1,504 @@
+################################################################################
+# deploy/06-spire-server.yaml
+#
+# SPIRE Server — the Certificate Authority for trust domain "gravitino.demo"
+#
+# WHAT THIS FILE DEPLOYS:
+#   1. Namespace-scoped RBAC for SPIRE Server
+#   2. Cluster-scoped RBAC for node attestation (reading k8s API objects)
+#   3. ConfigMap: spire-server — server config (trust domain, plugins, OIDC)
+#   4. ConfigMap: spire-oidc  — OIDC Discovery Provider config
+#   5. StatefulSet: spire-server
+#        container[0] spire-server        — the SPIRE Server process
+#        container[1] spire-oidc-provider — serves JWKS endpoint on :8008
+#   6. Service: spire-server  — ClusterIP :8081  (used by SPIRE Agents)
+#   7. Service: spire-oidc    — ClusterIP :8008  (used by Gravitino for JWKS)
+#
+# HOW SPIRE SERVER WORKS (fundamentals):
+#
+#   Trust Domain
+#   ────────────
+#   Every SPIFFE deployment belongs to a "trust domain" — an administrative
+#   boundary similar to a DNS domain. Ours is "gravitino.demo".
+#   All SPIFFE IDs in this system look like:
+#       spiffe://gravitino.demo/<workload-name>
+#
+#   SVIDs (SPIFFE Verifiable Identity Documents)
+#   ────────────────────────────────────────────
+#   SPIRE issues two kinds of credentials:
+#     • X.509-SVID — a TLS certificate with the SPIFFE URI in the SAN field.
+#                    Used for mutual TLS (both parties authenticate each other).
+#     • JWT-SVID   — a signed JWT with the SPIFFE URI in the "sub" claim.
+#                    Used as a Bearer token in HTTP Authorization headers.
+#   In our setup Spark workloads get JWT-SVIDs to present to Gravitino's
+#   OAuth2 endpoint as Bearer tokens.
+#
+#   Node Attestation (k8s_sat plugin)
+#   ──────────────────────────────────
+#   Before a SPIRE Agent can register with the server, the server must verify
+#   the agent is running on a legitimate Kubernetes node — not a rogue process.
+#   The k8s_sat (Kubernetes Service Account Token) plugin works like this:
+#     1. Agent starts, reads its own projected ServiceAccount token from disk
+#     2. Agent sends that token to the SPIRE Server
+#     3. Server calls the Kubernetes TokenReview API to verify the token
+#     4. If valid, server issues an X.509-SVID to the agent
+#   This means no static secrets need to be shared — Kubernetes PKI does the
+#   bootstrapping.
+#
+#   OIDC Discovery Provider
+#   ────────────────────────
+#   Gravitino's OAuth2 integration validates incoming JWT-SVIDs using the
+#   JWKS (JSON Web Key Set) endpoint. Rather than hard-coding SPIRE's public
+#   key into Gravitino, the OIDC Discovery Provider exposes a standard OIDC
+#   discovery URL that returns SPIRE's current signing keys. Gravitino fetches
+#   the keys automatically, so key rotation works without config changes.
+#
+#   Data store: SQLite (persisted via PVC "spire-data")
+#   Bind address: 0.0.0.0:8081
+################################################################################
+
+---
+# ── ServiceAccount for SPIRE Server ──────────────────────────────────────────
+# SPIRE Server needs its own ServiceAccount so Kubernetes can enforce fine-
+# grained API permissions (principle of least privilege).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: gravitino
+
+---
+# ── ClusterRole: node attestation permissions ─────────────────────────────────
+# SPIRE Server must call the Kubernetes API to attest SPIRE Agents via the
+# k8s_sat plugin. Specifically it needs:
+#   • TokenReview — verify a ServiceAccount token a SPIRE Agent presents
+#   • nodes get/list — identify which physical node the agent runs on
+# ClusterRole is needed because nodes are cluster-scoped (not namespaced).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+---
+# ── ClusterRoleBinding: bind the ClusterRole to spire-server ServiceAccount ──
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-cluster-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-server-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: gravitino
+
+---
+# ── Role: namespace-scoped permissions ───────────────────────────────────────
+# For listing pods (used during workload attestation debugging) and reading
+# configmaps (bundle sync). These are namespace-scoped, so a Role suffices.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-server-role
+  namespace: gravitino
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-server-role-binding
+  namespace: gravitino
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spire-server-role
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: gravitino
+
+---
+# ── ConfigMap: SPIRE Server configuration ────────────────────────────────────
+# HCL (HashiCorp Configuration Language) format — the native config format for
+# SPIRE. Key sections:
+#
+#   server { ... }         — core server settings
+#   plugins { ... }        — pluggable backends (storage, key manager, etc.)
+#   health_checks { ... }  — liveness/readiness probe endpoint
+#
+# Plugin architecture is central to SPIRE's design — you swap plugins to
+# change how nodes are attested, how keys are stored, how SVIDs are issued.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: gravitino
+data:
+  server.conf: |
+    server {
+      # The trust domain is the administrative boundary for SPIFFE identities.
+      # All SPIFFE IDs in this deployment will have the form:
+      #   spiffe://gravitino.demo/<path>
+      trust_domain = "gravitino.demo"
+
+      # Where SPIRE Agents connect to register and get SVIDs issued.
+      bind_address = "0.0.0.0"
+      bind_port    = "8081"
+
+      # SVID TTL — how long each issued X.509 certificate remains valid.
+      # Short TTL = frequent rotation = better security; 1h is a good default.
+      default_x509_svid_ttl = "1h"
+
+      # JWT-SVID TTL — how long a JWT Bearer token remains valid.
+      # Spark jobs are short-lived, 5m is generous but tight enough.
+      default_jwt_svid_ttl = "5m"
+
+      # CA TTL — how long SPIRE's own signing certificate is valid.
+      # Longer than SVID TTL so rotations don't cascade.
+      ca_ttl = "24h"
+
+      # Log level. INFO is good for production; DEBUG for troubleshooting.
+      log_level = "INFO"
+
+      # Enables the OIDC JWT issuer — required so JWT-SVIDs have an "iss"
+      # claim that Gravitino's OAuth2 validator can verify against.
+      # The URL must match what Gravitino is configured to trust as the issuer.
+      jwt_issuer = "http://spire-oidc.gravitino.svc.cluster.local:8008"
+    }
+
+    plugins {
+      # ── DataStore ──────────────────────────────────────────────────────────
+      # Where SPIRE persists its state: registered workload entries, issued
+      # bundles, agent records. SQLite is fine for single-node demos; for
+      # production you'd use PostgreSQL.
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+
+      # ── NodeAttestor ───────────────────────────────────────────────────────
+      # k8s_sat = Kubernetes Service Account Token attestation.
+      # When a SPIRE Agent starts, it reads a projected ServiceAccount token
+      # and presents it to the server. The server verifies it via the k8s
+      # TokenReview API. On success, the agent receives an SVID and is trusted.
+      NodeAttestor "k8s_sat" {
+        plugin_data {
+          clusters = {
+            # "gravitino-demo" is an arbitrary label for this k8s cluster.
+            # SPIRE uses it internally to track which cluster an agent belongs to.
+            "gravitino-demo" = {
+              # The SPIRE Agent's ServiceAccount. The server checks that the
+              # token belongs to this ServiceAccount (not just any token).
+              service_account_allow_list = ["gravitino:spire-agent"]
+
+              # The server fetches this token from the Kubernetes API during
+              # attestation. Must match the projected volume in the Agent pod.
+              use_token_review_api_validation = true
+            }
+          }
+        }
+      }
+
+      # ── KeyManager ─────────────────────────────────────────────────────────
+      # Where SPIRE stores its signing keys. "disk" persists keys in a local
+      # file — survives pod restarts via the PVC. For production use an HSM
+      # or cloud KMS (AWS KMS, GCP CloudHSM) so keys never leave hardware.
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/run/spire/data/keys.json"
+        }
+      }
+
+      # ── BundlePublisher ────────────────────────────────────────────────────
+      # The trust bundle is the set of CA certificates that SPIRE Agents use
+      # to verify SVIDs issued by this server. The k8s_configmap publisher
+      # writes the bundle to a ConfigMap, making it accessible to workloads
+      # that need to trust SPIRE-issued certificates.
+      BundlePublisher "k8s_configmap" {
+        plugin_data {
+          namespace      = "gravitino"
+          configmap_name = "spire-bundle"
+        }
+      }
+    }
+
+    health_checks {
+      # Readiness/liveness probe endpoint — used by the StatefulSet below.
+      listener_enabled = true
+      bind_address     = "0.0.0.0"
+      bind_port        = "8080"
+      live_path        = "/live"
+      ready_path       = "/ready"
+    }
+
+---
+# ── ConfigMap: OIDC Discovery Provider configuration ─────────────────────────
+# The OIDC Discovery Provider is a lightweight HTTP server (separate binary
+# from the SPIRE Server) that exposes two endpoints:
+#
+#   GET /.well-known/openid-configuration
+#       Returns OIDC metadata — which issuer URL, where to find JWKS, etc.
+#       Gravitino reads this to auto-discover the JWKS endpoint.
+#
+#   GET /keys
+#       Returns the JWKS (JSON Web Key Set) — SPIRE's current public signing
+#       keys. Gravitino uses these to cryptographically verify JWT-SVIDs.
+#
+# Why do we need this? Gravitino validates incoming JWT tokens by:
+#   1. Reading the "iss" (issuer) claim from the token
+#   2. Fetching /.well-known/openid-configuration from that issuer URL
+#   3. Following the "jwks_uri" to get the public keys
+#   4. Verifying the token signature against those keys
+# This is standard OAuth2/OIDC — SPIRE just implements the provider side.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-oidc
+  namespace: gravitino
+data:
+  oidc-discovery-provider.conf: |
+    log_level = "INFO"
+
+    # The SPIRE Server API socket — the OIDC provider uses this to fetch
+    # the current signing keys from the server process.
+    server_api {
+      address = "unix:///run/spire/sockets/server.sock"
+    }
+
+    workload_api {
+      socket_path = "/run/spire/sockets/agent.sock"
+    }
+
+    # The domains the OIDC provider will respond to.
+    # Must match the jwt_issuer configured in the server above (just the host).
+    domains = ["spire-oidc.gravitino.svc.cluster.local"]
+
+    # Insecure port — Gravitino fetches JWKS over plain HTTP here because
+    # the communication stays within the cluster. For external exposure you
+    # would terminate TLS.
+    acme {
+      # No ACME — we use insecure HTTP inside the cluster.
+      # The OIDC provider binary requires this section even when not using ACME.
+      directory_url  = ""
+      tos_accepted   = false
+      email          = ""
+      cache_dir      = "/run/spire/oidc-cache"
+    }
+
+    # Serve on plain HTTP (no TLS) for intra-cluster communication.
+    listen_socket_path = ""
+
+---
+# ── PVC: SPIRE Server persistent data ────────────────────────────────────────
+# Stores SQLite database (workload entries, bundle history) and signing keys.
+# Without this, every server restart loses all registered workload entries
+# and all agents must re-attest.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: spire-data
+  namespace: gravitino
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: hostpath
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+# ── StatefulSet: SPIRE Server ─────────────────────────────────────────────────
+# Why StatefulSet instead of Deployment?
+# SPIRE Server holds the CA private key. If you run two replicas simultaneously
+# they must share the same key — otherwise agents and workloads can't trust
+# both. StatefulSet with 1 replica + a PVC gives us:
+#   • A stable network identity (DNS: spire-server-0.spire-server)
+#   • Persistent storage that survives pod restarts
+#   • Single-replica guarantee (no split-brain key management)
+# For HA production deployments, SPIRE supports a "HA mode" where multiple
+# servers share state via PostgreSQL — but that's beyond our demo scope.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: gravitino
+  labels:
+    app: spire-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  serviceName: spire-server
+  template:
+    metadata:
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+
+      # initContainer: create the OIDC cache directory
+      # The OIDC provider writes cached JWKS responses here. Must exist before
+      # the provider starts, and must be writable by the oidc container user.
+      initContainers:
+        - name: init-dirs
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /run/spire/sockets /run/spire/data /run/spire/oidc-cache && chmod 777 /run/spire/sockets /run/spire/data /run/spire/oidc-cache"]
+          volumeMounts:
+            - name: spire-sockets
+              mountPath: /run/spire/sockets
+            - name: spire-data
+              mountPath: /run/spire/data
+            - name: oidc-cache
+              mountPath: /run/spire/oidc-cache
+
+      containers:
+        # ── Container 0: SPIRE Server ────────────────────────────────────────
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.9.6
+          args:
+            - "-config"
+            - "/run/spire/config/server.conf"
+          ports:
+            - name: grpc
+              containerPort: 8081
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            # Server configuration (from ConfigMap above)
+            - name: spire-server-config
+              mountPath: /run/spire/config
+              readOnly: true
+            # Persistent data: SQLite + signing keys
+            - name: spire-data
+              mountPath: /run/spire/data
+            # Unix domain socket — shared with the OIDC provider sidecar.
+            # The OIDC provider fetches JWKS from the server via this socket.
+            # This is how SPIRE components communicate locally without network.
+            - name: spire-sockets
+              mountPath: /run/spire/sockets
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+        # ── Container 1: OIDC Discovery Provider ─────────────────────────────
+        # This sidecar runs alongside the SPIRE Server in the same pod.
+        # It reads SPIRE's current signing keys via the shared Unix socket,
+        # and serves them as a standard OIDC JWKS endpoint on port 8008.
+        #
+        # Gravitino will be configured with:
+        #   oauth.serverUri = http://spire-oidc.gravitino.svc.cluster.local:8008
+        # When Gravitino receives a JWT-SVID Bearer token, it fetches:
+        #   http://spire-oidc.gravitino.svc.cluster.local:8008/keys
+        # ...gets SPIRE's public key, and verifies the token signature.
+        - name: spire-oidc-provider
+          image: ghcr.io/spiffe/oidc-discovery-provider:1.9.6
+          args:
+            - "-config"
+            - "/run/spire/oidc-config/oidc-discovery-provider.conf"
+            # insecure = serve plain HTTP (no TLS cert required)
+            # Appropriate because traffic stays within the Kubernetes cluster.
+            - "-insecure"
+          ports:
+            - name: oidc
+              containerPort: 8008
+              protocol: TCP
+          volumeMounts:
+            - name: spire-oidc-config
+              mountPath: /run/spire/oidc-config
+              readOnly: true
+            # The shared socket — OIDC provider reads keys from SPIRE Server here
+            - name: spire-sockets
+              mountPath: /run/spire/sockets
+              readOnly: true
+            - name: oidc-cache
+              mountPath: /run/spire/oidc-cache
+
+      volumes:
+        - name: spire-server-config
+          configMap:
+            name: spire-server
+        - name: spire-oidc-config
+          configMap:
+            name: spire-oidc
+        # Shared Unix socket directory — both SPIRE Server and OIDC Provider
+        # mount this same emptyDir. The server creates a socket file here;
+        # the OIDC provider connects to it. emptyDir lives as long as the pod.
+        - name: spire-sockets
+          emptyDir: {}
+        # Persistent SPIRE data — survives pod restarts
+        - name: spire-data
+          persistentVolumeClaim:
+            claimName: spire-data
+        - name: oidc-cache
+          emptyDir: {}
+
+---
+# ── Service: SPIRE Server (gRPC for Agents) ───────────────────────────────────
+# SPIRE Agents connect to this service to:
+#   1. Attest themselves (prove they're running on a real k8s node)
+#   2. Fetch SVIDs for workloads on their node
+#   3. Subscribe to bundle updates (CA cert rotations)
+# Port 8081 is SPIRE's default gRPC port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: gravitino
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: grpc
+      protocol: TCP
+  type: ClusterIP
+
+---
+# ── Service: OIDC Discovery Provider (HTTP for JWKS) ─────────────────────────
+# Gravitino fetches SPIRE's public keys from this endpoint.
+# Also used by any other service that needs to validate SPIRE JWT-SVIDs.
+#
+# Endpoints served:
+#   GET http://spire-oidc.gravitino.svc.cluster.local:8008/.well-known/openid-configuration
+#   GET http://spire-oidc.gravitino.svc.cluster.local:8008/keys
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-oidc
+  namespace: gravitino
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - name: oidc
+      port: 8008
+      targetPort: oidc
+      protocol: TCP
+  type: ClusterIP

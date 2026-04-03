@@ -1,0 +1,320 @@
+################################################################################
+# deploy/07-spire-agent.yaml
+#
+# SPIRE Agent — the per-node daemon that issues SVIDs to workloads
+#
+# WHAT THIS FILE DEPLOYS:
+#   1. ServiceAccount for the SPIRE Agent
+#   2. ClusterRole + ClusterRoleBinding for workload attestation
+#   3. ConfigMap: spire-agent — agent configuration
+#   4. DaemonSet: spire-agent (one pod per node)
+#
+# HOW SPIRE AGENT WORKS (fundamentals):
+#
+#   The Agent is the "last mile" of the SPIFFE system. It runs on every
+#   Kubernetes node and is responsible for:
+#
+#   1. Node Attestation (agent ↔ server, happens at startup)
+#   ──────────────────────────────────────────────────────
+#   The Agent must prove to the Server that it's running on a legitimate
+#   Kubernetes node. Using the k8s_sat plugin:
+#     a. Agent reads its own ServiceAccount token (projected into the pod)
+#     b. Agent sends the token to the SPIRE Server over gRPC
+#     c. Server calls Kubernetes TokenReview API to verify the token
+#     d. Server verifies the token belongs to ServiceAccount "spire-agent"
+#        in namespace "gravitino"
+#     e. Server issues an X.509-SVID to the agent:
+#        spiffe://gravitino.demo/spire/agent/k8s_sat/gravitino-demo/<node-uid>
+#   After this, the Agent is trusted and can request SVIDs on behalf of
+#   workloads running on its node.
+#
+#   2. Workload Attestation (agent ↔ workload, happens on each SVID request)
+#   ──────────────────────────────────────────────────────────────────────────
+#   When a workload (e.g., a Spark pod) calls the Workload API:
+#     a. The workload makes a gRPC call to the Unix socket on its node
+#        (the socket is mounted into pods via hostPath)
+#     b. The Agent intercepts the call and inspects the caller:
+#        - Reads the caller's OS process ID (PID) via SO_PEERCRED
+#        - Calls the Kubernetes API to find which pod the PID belongs to
+#        - Checks the pod's labels, namespace, and ServiceAccount
+#     c. The Agent looks up registered workload entries in the Server
+#        to find an entry whose selector matches this pod's attributes
+#     d. If a match is found, the Agent requests an SVID from the Server
+#        for the matched SPIFFE ID, then returns it to the workload
+#   The workload never talks to the Server directly — the Agent proxies
+#   all SVID requests. This is the "workload isolation" model of SPIFFE.
+#
+#   3. SVID Caching and Rotation
+#   ────────────────────────────
+#   The Agent caches SVIDs locally and automatically renews them before
+#   they expire (by default, at 50% of TTL). This means workloads always
+#   have a valid SVID without needing to manage certificate lifecycle.
+#
+#   Unix Socket Path
+#   ────────────────
+#   Workloads access the Agent via a Unix domain socket:
+#     /run/spire/sockets/agent.sock
+#   This socket is exposed to workload pods via a hostPath volume mount.
+#   Only processes running on the same node as the Agent can reach it.
+#
+#   Why DaemonSet?
+#   ──────────────
+#   One Agent must run on EVERY node where workloads will request SVIDs.
+#   The Agent's security model is node-local: it can only attest workloads
+#   running on its own node (verified via PID → pod lookup in the local
+#   kubelet). A DaemonSet ensures this 1:1 mapping automatically.
+################################################################################
+
+---
+# ── ServiceAccount for SPIRE Agent ───────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent
+  namespace: gravitino
+
+---
+# ── ClusterRole: workload attestation permissions ─────────────────────────────
+# The Agent needs to call the Kubernetes API to identify which pod a workload
+# PID belongs to. Specifically:
+#   • pods get/list  — find the pod that contains the caller's PID
+#   • nodes get/list — verify the agent is running on the correct node
+# These are cluster-scoped resources, so ClusterRole is required.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent-cluster-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-agent-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: gravitino
+
+---
+# ── ConfigMap: SPIRE Agent configuration ─────────────────────────────────────
+# Key sections:
+#   agent { ... }    — core settings: trust domain, server address, socket path
+#   plugins { ... }  — node attestor + workload attestor + key manager
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent
+  namespace: gravitino
+data:
+  agent.conf: |
+    agent {
+      # Must match the trust_domain in the server config.
+      # Any mismatch → the server rejects the agent's attestation.
+      trust_domain = "gravitino.demo"
+
+      # Where SPIRE Server listens. Note: we use the ClusterIP Service DNS name.
+      # The Agent connects here over gRPC to:
+      #   • Attest itself at startup
+      #   • Fetch SVIDs on behalf of workloads
+      #   • Receive bundle updates
+      server_address = "spire-server.gravitino.svc.cluster.local"
+      server_port    = "8081"
+
+      # The Unix socket path where workloads call the Workload API.
+      # Workload pods must mount this socket (via hostPath volume) to get SVIDs.
+      # The path /run/spire/sockets/agent.sock is the SPIFFE standard location.
+      socket_path = "/run/spire/sockets/agent.sock"
+
+      # Where the Agent stores its own SVID (issued by the Server after
+      # node attestation). Survives restarts so the agent doesn't need to
+      # re-attest on every pod restart (only re-attests on SVID expiry).
+      data_dir = "/run/spire/agent-data"
+
+      log_level = "INFO"
+    }
+
+    plugins {
+      # ── NodeAttestor ───────────────────────────────────────────────────────
+      # The Agent's side of k8s_sat attestation.
+      # It reads a projected ServiceAccount token and presents it to the Server.
+      #
+      # token_path: The projected token is automatically mounted here by
+      # Kubernetes (see the volumeProjection in the DaemonSet spec below).
+      # This is NOT the default ServiceAccount token — it's a projected token
+      # with a specific audience, making it usable only for SPIRE attestation.
+      NodeAttestor "k8s_sat" {
+        plugin_data {
+          # Must match the cluster name registered in the server's NodeAttestor config.
+          cluster      = "gravitino-demo"
+          token_path   = "/run/spire/token"
+        }
+      }
+
+      # ── WorkloadAttestor ───────────────────────────────────────────────────
+      # The Kubernetes workload attestor identifies workloads by inspecting
+      # Kubernetes metadata of the calling pod. When a pod requests an SVID:
+      #   1. Agent gets the caller's PID via SO_PEERCRED on the Unix socket
+      #   2. Agent calls kubelet's /pods API (on the local node) to find the
+      #      pod containing that PID
+      #   3. Agent extracts pod labels, namespace, ServiceAccount name, etc.
+      #   4. These become "selectors" matched against workload entries
+      #
+      # Selectors this attestor can produce (used in workload entry registration):
+      #   k8s:ns:<namespace>                — pod's namespace
+      #   k8s:sa:<serviceaccount>           — pod's ServiceAccount
+      #   k8s:pod-label:<key>:<value>       — pod labels  ← we use this
+      #   k8s:container-name:<name>         — specific container name
+      #
+      # We use pod-label selectors because they're flexible: adding a label
+      # to a pod's spec is enough to make it a trusted SPIFFE workload.
+      WorkloadAttestor "k8s" {
+        plugin_data {
+          # Skip verifying the kubelet TLS certificate. In production you'd
+          # configure proper kubelet CA verification, but for a local demo
+          # this avoids certificate setup complexity.
+          skip_kubelet_verification = true
+        }
+      }
+
+      # ── KeyManager ─────────────────────────────────────────────────────────
+      # Where the Agent stores its own private key (used for its node SVID).
+      # "memory" is ephemeral — the key is regenerated on restart (triggers
+      # re-attestation). This is fine for a demo; in production use "disk".
+      KeyManager "memory" {
+        plugin_data {}
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address     = "0.0.0.0"
+      bind_port        = "8082"
+      live_path        = "/live"
+      ready_path       = "/ready"
+    }
+
+---
+# ── DaemonSet: SPIRE Agent ────────────────────────────────────────────────────
+# Runs one Agent pod on every node. This is critical:
+#   • Each Agent can only attest workloads on its own node
+#   • Each Agent connects to the SPIRE Server to get SVIDs
+#   • The Unix socket is bind-mounted from the Agent pod to the node's
+#     filesystem, making it accessible to workload pods via hostPath
+#
+# Security notes:
+#   • hostPID: true — the Agent needs to see PID namespaces of other pods
+#     to resolve PID → pod mappings during workload attestation
+#   • hostPath for sockets — intentionally broad; workloads mount it to get SVIDs
+#   • privileged: false — the Agent does NOT need root; it uses the kubelet API
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: gravitino
+  labels:
+    app: spire-agent
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      serviceAccountName: spire-agent
+      # hostPID allows the Agent to resolve a workload's PID to its cgroup/pod.
+      # Without this, k8s workload attestation cannot map PIDs to pods.
+      hostPID: true
+
+      initContainers:
+        - name: init-dirs
+          image: busybox:1.36
+          command: ["sh", "-c", "mkdir -p /run/spire/sockets /run/spire/agent-data && chmod 777 /run/spire/sockets"]
+          volumeMounts:
+            - name: spire-sockets
+              mountPath: /run/spire/sockets
+            - name: agent-data
+              mountPath: /run/spire/agent-data
+
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.9.6
+          args:
+            - "-config"
+            - "/run/spire/config/agent.conf"
+          ports:
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          volumeMounts:
+            - name: spire-agent-config
+              mountPath: /run/spire/config
+              readOnly: true
+            # The projected ServiceAccount token used for node attestation.
+            # This is not the default SA token — it has a specific audience
+            # ("spiffe://gravitino.demo") that the SPIRE Server checks.
+            - name: spire-token
+              mountPath: /run/spire/token
+              # The token is mounted as a file, not a directory
+              subPath: token
+            # The Unix socket directory — exposed to other pods via hostPath below.
+            # The Agent creates agent.sock here; workloads connect to it.
+            - name: spire-sockets
+              mountPath: /run/spire/sockets
+            - name: agent-data
+              mountPath: /run/spire/agent-data
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8082
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+      volumes:
+        - name: spire-agent-config
+          configMap:
+            name: spire-agent
+        # Projected ServiceAccount token for node attestation.
+        # "projected" tokens differ from default SA tokens:
+        #   • They have a configurable audience (prevents token reuse)
+        #   • They have a configurable TTL (auto-rotated by kubelet)
+        #   • They are NOT stored in a Secret (less risk of theft)
+        # expirationSeconds: 7200 = token rotates every 2 hours
+        # audience: "spiffe://gravitino.demo" = token is useless to other systems
+        - name: spire-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 7200
+                  audience: "spiffe://gravitino.demo"
+        # hostPath socket directory — this is how the Agent socket is shared
+        # with workload pods. The path /run/spire/sockets is created on the
+        # node by the initContainer, then workload pods mount the same path
+        # to access the Agent's Unix socket.
+        #
+        # Security implication: any pod with access to this hostPath can
+        # request SVIDs. That's why workload entries have specific selectors
+        # (pod labels) — not every pod that mounts the socket gets an SVID;
+        # only pods whose labels match a registered workload entry.
+        - name: spire-sockets
+          hostPath:
+            path: /run/spire/sockets
+            type: DirectoryOrCreate
+        - name: agent-data
+          emptyDir: {}
