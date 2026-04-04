@@ -4,139 +4,121 @@
 # Gravitino Helm values overlay — adds OAuth2 + RBAC on top of the base config
 #
 # HOW TO APPLY:
-#   # Upgrade Gravitino with SPIRE OAuth2 + RBAC (layered on top of base values):
+#   # Use --reuse-values to preserve existing S3/HMS config, then overlay SPIRE:
 #   helm upgrade gravitino ./gravitino -n gravitino \
-#     -f deploy/03-gravitino-values.yaml \
+#     --reuse-values \
 #     -f deploy/09-gravitino-values-spire.yaml
 #
-#   # The second -f file overrides/extends the first. Helm merges them.
+# WHAT CHANGES FROM THE BASE DEPLOYMENT:
+#   This file ONLY sets the authentication and authorization fields.
+#   All existing values (icebergRest, persistence, extraVolumes, etc.)
+#   are preserved by --reuse-values.
 #
-# WHAT CHANGES:
-#   The base values (03-gravitino-values.yaml) configure the Iceberg REST
-#   backend, S3 storage, and HMS connection. This file adds:
-#     1. OAuth2 authentication via SPIRE's OIDC endpoint (JWT validation)
-#     2. Gravitino authorization (RBAC) enforcement
+# HOW GRAVITINO OAUTH2 + SPIRE WORKS:
 #
-# HOW GRAVITINO OAUTH2 WORKS WITH SPIRE:
-#
-#   Standard OAuth2 Bearer Token Flow:
-#   ────────────────────────────────────
-#   1. Workload (Spark pod) asks SPIRE Agent for a JWT-SVID:
+#   Token validation flow:
+#   ──────────────────────
+#   1. Workload (Spark pod) fetches JWT-SVID from SPIRE Agent:
 #        {"sub": "spiffe://gravitino.demo/spark-oc-writer",
 #         "iss": "http://spire-oidc.gravitino.svc.cluster.local:8008",
-#         "aud": ["gravitino"],
-#         "exp": <5 minutes from now>}
+#         "aud": ["gravitino"], "exp": <now+5min>}
 #
-#   2. Spark pod sends API request to Gravitino with:
-#        Authorization: Bearer <jwt-svid>
+#   2. Spark sends to Gravitino: Authorization: Bearer <jwt>
 #
-#   3. Gravitino validates the JWT:
-#        a. Reads "iss" claim → "http://spire-oidc.gravitino.svc.cluster.local:8008"
-#        b. Fetches http://spire-oidc.../.well-known/openid-configuration
-#        c. Gets the "jwks_uri" from that document
-#        d. Fetches the JWKS (public keys)
-#        e. Verifies the JWT signature using those keys
-#        f. Checks "exp" hasn't passed, "aud" includes "gravitino"
+#   3. Gravitino's OAuth2 authenticator validates the token:
+#        a. Checks "aud" contains serviceAudience ("gravitino") ✓
+#        b. Fetches JWKS from serverUri/.well-known/openid-configuration
+#           → follows jwks_uri → fetches SPIRE's RS256 public keys
+#        c. Verifies JWT signature using those public keys
+#        d. Checks "exp" hasn't passed
+#        e. Extracts "sub" as the principal identity
 #
-#   4. Gravitino extracts the "sub" claim as the user identity:
-#        sub = "spiffe://gravitino.demo/spark-oc-writer"
+#   4. Gravitino checks RBAC: is "spiffe://gravitino.demo/spark-oc-writer"
+#      authorized for this operation? → looks up roles → evaluates privileges
 #
-#   5. Gravitino checks RBAC:
-#        Does "spiffe://gravitino.demo/spark-oc-writer" have privilege
-#        to perform this operation on this catalog?
-#
-#   6. If authorized → execute. If not → 403 Forbidden.
-#
-#   Why this is stronger than static tokens:
-#     • JWT-SVIDs expire in 5 minutes → stolen tokens quickly become useless
-#     • SPIRE controls who can get a JWT-SVID (workload attestation)
-#     • No static passwords or API keys to rotate or leak
-#     • Gravitino never stores credentials — it just validates JWTs
+# Helm values reference (from gravitino chart templates/configmap.yaml):
+#   gravitino.authenticators          → .Values.authenticators
+#   gravitino.authenticator.oauth.*   → .Values.authenticator.oauth.*
+#   gravitino.authorization.enable    → .Values.authorization.enable
+#   gravitino.authorization.serviceAdmins → .Values.authorization.serviceAdmins
 ################################################################################
 
-# ── OAuth2 Authentication configuration ───────────────────────────────────────
-# Tells Gravitino to validate Bearer tokens using SPIRE's OIDC endpoint.
+# ── Authentication: switch from "simple" to "oauth" ──────────────────────────
+# "simple" (default) = accepts any username string, no verification.
+# "oauth"            = validates Bearer JWT against OIDC JWKS endpoint.
 #
-# NOTE: The exact Helm values keys depend on the Gravitino Helm chart version.
-# For Gravitino 1.x the server config is managed via extraEnv or a custom
-# gravitino.conf configmap override. The settings below map to the
-# gravitino.conf file entries that Gravitino reads at startup.
-#
-# Gravitino server config keys (from gravitino.conf reference):
-#   gravitino.authenticator          = oauth
-#   gravitino.authenticator.oauth.serverUri = <OIDC discovery URL>
-#   gravitino.authenticator.oauth.tokenPath = <token validation path>
-#   gravitino.authenticator.oauth.defaultSignKey = <JWKS fetch key>
-#   gravitino.authenticator.oauth.allowSkewSecs = <clock skew tolerance>
-#   gravitino.authorization.enable   = true
-#
-# We pass these as environment variables that the Gravitino chart injects
-# into gravitino.conf via its templating mechanism.
+# Note: the config key is "authenticators" (plural) in Gravitino 1.x
+authenticators: oauth
 
-extraEnv:
-  # ── Authentication: tell Gravitino to use OAuth2 ──────────────────────────
-  - name: GRAVITINO_AUTHENTICATOR
-    value: "oauth"
+# ── OAuth2 authenticator configuration ───────────────────────────────────────
+authenticator:
+  oauth:
+    # The audience claim Gravitino expects in incoming JWTs.
+    # SPIRE issues JWT-SVIDs with "aud": ["gravitino"] (configured in
+    # the -audience flag when calling spire-agent api fetch jwt).
+    # Gravitino rejects any token whose "aud" doesn't include this value.
+    serviceAudience: gravitino
 
-  # The OIDC discovery URL. Gravitino fetches:
-  #   GET http://spire-oidc.gravitino.svc.cluster.local:8008/.well-known/openid-configuration
-  # and auto-discovers the JWKS endpoint from the returned JSON.
-  # This must exactly match the "iss" (issuer) claim in the JWT-SVIDs that
-  # SPIRE issues — see jwt_issuer in 06-spire-server.yaml.
-  - name: GRAVITINO_AUTHENTICATOR_OAUTH_SERVER_URI
-    value: "http://spire-oidc.gravitino.svc.cluster.local:8008"
+    # The OIDC issuer URL. Gravitino:
+    #   1. Fetches http://spire-oidc.../.well-known/openid-configuration
+    #   2. Reads the "jwks_uri" from the returned JSON
+    #   3. Fetches the JWKS (public keys) from that URI
+    #   4. Uses those keys to verify JWT signatures (RS256)
+    #
+    # This must exactly match the "iss" claim in SPIRE JWT-SVIDs.
+    # See jwt_issuer in deploy/06-spire-server.yaml.
+    # Must match the SPIRE jwt_issuer and the OIDC discovery doc issuer.
+    # SPIRE OIDC Provider always reports "https://" in the discovery doc,
+    # so this must use https and no port (even though traffic is HTTP on :8008).
+    serverUri: "https://spire-oidc.gravitino.svc.cluster.local"
 
-  # The path within the OIDC server to fetch the JWKS (public keys).
-  # Standard OIDC path — the discovery document points here.
-  - name: GRAVITINO_AUTHENTICATOR_OAUTH_TOKEN_PATH
-    value: "/keys"
+    # Leave empty — used only for HMAC (HS256) token validation.
+    # SPIRE uses RS256 (asymmetric) so the signing key comes from JWKS.
+    defaultSignKey: ""
 
-  # The audience claim Gravitino expects in incoming JWT-SVIDs.
-  # SPIRE will be configured to set "aud: gravitino" in issued JWTs.
-  # Gravitino rejects any token whose "aud" doesn't include this value.
-  - name: GRAVITINO_AUTHENTICATOR_OAUTH_DEFAULT_SIGN_KEY
-    value: "gravitino"
+    # The path on serverUri to fetch a token (used for client-credentials
+    # flow in some OAuth2 setups). For SPIRE, we don't use this flow —
+    # SPIRE issues tokens via its own Workload API. Set to JWKS path
+    # so Gravitino can directly fetch keys if needed.
+    tokenPath: "/keys"
 
-  # Clock skew tolerance in seconds. Allows for small time differences
-  # between the SPIRE Server and Gravitino pod clocks. JWT "exp" validation
-  # will accept tokens that expired up to 30s ago (accounts for network delay).
-  - name: GRAVITINO_AUTHENTICATOR_OAUTH_ALLOW_SKEW_SECS
-    value: "30"
+    # Direct JWKS URI. Points at the SPIRE OIDC Discovery Provider's key endpoint.
+    # Uses HTTP on port 8008 (insecure_addr) — bypasses OIDC discovery so
+    # Gravitino fetches keys directly without following the https:// jwks_uri
+    # from the discovery doc (which would fail since we serve HTTP not HTTPS).
+    jwksUri: "http://spire-oidc.gravitino.svc.cluster.local:8008/keys"
 
-  # ── Authorization: enable Gravitino RBAC ──────────────────────────────────
-  # When enabled, every API call is checked against the RBAC model:
-  #   User (SPIFFE ID) → Role → Privilege → Resource
-  # Without this, authentication succeeds but authorization is not enforced
-  # (any authenticated user can do anything).
-  - name: GRAVITINO_AUTHORIZATION_ENABLE
-    value: "true"
+    # Provider type hint. Leave empty for custom OIDC (SPIRE).
+    provider: ""
 
-# ── Iceberg REST — unchanged from base values ──────────────────────────────────
-# We re-declare these here to ensure they're preserved when Helm merges the
-# two values files. Helm deep-merges maps, so only changed keys need to be
-# specified — but icebergRest is safe to repeat for clarity.
-icebergRest:
-  classpath: "iceberg-rest-server/libs, iceberg-rest-server/conf"
-  catalogBackend: hive
-  uri: "thrift://hive-metastore.gravitino.svc.cluster.local:9083"
-  warehouse: "s3a://operational/iceberg-warehouse"
-  ioImpl: org.apache.iceberg.aws.s3.S3FileIO
-  s3:
-    accessKeyId: admin
-    secretAccessKey: admin
-    endpoint: "http://seaweedfs-filer.gravitino.svc.cluster.local:8333"
-    pathStyleAccess: "true"
-    region: "us-east-1"
+    # Not needed for SPIRE integration:
+    clientId: ""
+    authority: ""
+    scope: ""
+    tokenValidatorClass: ""
 
-# ── Extra volumes: SPIRE Agent socket ─────────────────────────────────────────
-# The Gravitino pod needs to talk to the SPIRE Agent for two reasons:
-#   1. Gravitino itself can get a SPIFFE identity (spiffe://gravitino.demo/gravitino)
-#      for mutual TLS with other SPIFFE-enabled services
-#   2. The SPIRE Agent's OIDC endpoint is used by Gravitino to validate JWTs —
-#      but this goes via the Service (HTTP), not the socket
-#
-# The socket mount is included for completeness and future mTLS use.
-# It doesn't affect JWT validation, which uses HTTP to the OIDC Service.
+    # The JWT claim to use as the principal (user identity) in Gravitino RBAC.
+    # "sub" is the standard SPIFFE claim containing the SPIFFE ID:
+    #   "spiffe://gravitino.demo/spark-oc-writer"
+    # This string becomes the Gravitino "user" that roles are assigned to.
+    principalFields: "sub"
+
+# ── Authorization: enable Gravitino RBAC ────────────────────────────────────
+authorization:
+  # When true, every authenticated request is checked against RBAC.
+  # A user must have an explicit privilege grant to perform any operation.
+  enable: true
+
+  # The service admin — bypasses RBAC for admin operations (user/role mgmt).
+  # This is the SPIFFE ID of the admin identity we registered in SPIRE.
+  # When a request arrives with JWT sub=spiffe://gravitino.demo/admin,
+  # it has full administrative access regardless of RBAC rules.
+  serviceAdmins: "spiffe://gravitino.demo/admin"
+
+# ── Volume mount for SPIRE Agent socket ─────────────────────────────────────
+# Gravitino gets the SPIRE socket so it can request its own SVID if needed
+# (for mTLS to HMS in future hardening). Not required for JWT validation
+# (which goes over HTTP to the OIDC service).
 extraVolumes:
   - name: gravitino-log
     emptyDir: {}

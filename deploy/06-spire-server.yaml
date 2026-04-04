@@ -154,9 +154,20 @@ data:
       #   spiffe://gravitino.demo/<path>
       trust_domain = "gravitino.demo"
 
+      # data_dir: where SPIRE stores runtime state (NOT the DataStore plugin path).
+      # Required top-level field in SPIRE 1.x. The DataStore sqlite3 file and
+      # the KeyManager key file are placed relative to this directory.
+      data_dir = "/run/spire/data"
+
       # Where SPIRE Agents connect to register and get SVIDs issued.
       bind_address = "0.0.0.0"
       bind_port    = "8081"
+
+      # The path for the SPIRE Server's local API Unix socket.
+      # Default is /tmp/spire-server/private/api.sock, but we put it in our
+      # shared emptyDir volume so the OIDC Discovery Provider sidecar can
+      # access it without mounting /tmp from the host.
+      socket_path = "/run/spire/sockets/server.sock"
 
       # SVID TTL — how long each issued X.509 certificate remains valid.
       # Short TTL = frequent rotation = better security; 1h is a good default.
@@ -175,8 +186,19 @@ data:
 
       # Enables the OIDC JWT issuer — required so JWT-SVIDs have an "iss"
       # claim that Gravitino's OAuth2 validator can verify against.
-      # The URL must match what Gravitino is configured to trust as the issuer.
-      jwt_issuer = "http://spire-oidc.gravitino.svc.cluster.local:8008"
+      #
+      # IMPORTANT: The SPIRE OIDC Discovery Provider always generates "https://"
+      # issuer URLs in the discovery document (regardless of insecure_addr).
+      # The jwt_issuer here must MATCH what the discovery doc reports so that
+      # Gravitino's issuer check (JWT iss == serverUri) passes.
+      #
+      # The discovery doc will report:
+      #   "issuer": "https://spire-oidc.gravitino.svc.cluster.local"
+      # (the domain from the `domains` config, with https scheme, no port)
+      # So jwt_issuer must be set to the same value.
+      #
+      # Actual key fetching uses HTTP on port 8008 via Gravitino's jwksUri config.
+      jwt_issuer = "https://spire-oidc.gravitino.svc.cluster.local"
     }
 
     plugins {
@@ -209,6 +231,9 @@ data:
               # The server fetches this token from the Kubernetes API during
               # attestation. Must match the projected volume in the Agent pod.
               use_token_review_api_validation = true
+
+              # audience not set — use the default Kubernetes API server audience.
+              # The projected token in the Agent pod spec has no custom audience.
             }
           }
         }
@@ -224,17 +249,11 @@ data:
         }
       }
 
-      # ── BundlePublisher ────────────────────────────────────────────────────
-      # The trust bundle is the set of CA certificates that SPIRE Agents use
-      # to verify SVIDs issued by this server. The k8s_configmap publisher
-      # writes the bundle to a ConfigMap, making it accessible to workloads
-      # that need to trust SPIRE-issued certificates.
-      BundlePublisher "k8s_configmap" {
-        plugin_data {
-          namespace      = "gravitino"
-          configmap_name = "spire-bundle"
-        }
-      }
+      # BundlePublisher "k8s_configmap" is NOT a built-in plugin in SPIRE 1.9.x
+      # (it was removed from built-ins). We omit it here — our demo uses
+      # JWT-SVIDs validated via the OIDC JWKS endpoint, so Gravitino fetches
+      # keys over HTTP rather than reading a bundle ConfigMap.
+      # For X.509-SVID mTLS scenarios you would need the external plugin.
     }
 
     health_checks {
@@ -274,34 +293,21 @@ data:
   oidc-discovery-provider.conf: |
     log_level = "INFO"
 
+    # insecure_addr: serve plain HTTP on this address (no TLS).
+    # In SPIRE 1.9.x the -insecure CLI flag was removed; HTTP is configured
+    # here in the config file instead. Appropriate for intra-cluster traffic.
+    insecure_addr = ":8008"
+
     # The SPIRE Server API socket — the OIDC provider uses this to fetch
     # the current signing keys from the server process.
+    # The server creates this socket; both containers share it via emptyDir.
     server_api {
       address = "unix:///run/spire/sockets/server.sock"
-    }
-
-    workload_api {
-      socket_path = "/run/spire/sockets/agent.sock"
     }
 
     # The domains the OIDC provider will respond to.
     # Must match the jwt_issuer configured in the server above (just the host).
     domains = ["spire-oidc.gravitino.svc.cluster.local"]
-
-    # Insecure port — Gravitino fetches JWKS over plain HTTP here because
-    # the communication stays within the cluster. For external exposure you
-    # would terminate TLS.
-    acme {
-      # No ACME — we use insecure HTTP inside the cluster.
-      # The OIDC provider binary requires this section even when not using ACME.
-      directory_url  = ""
-      tos_accepted   = false
-      email          = ""
-      cache_dir      = "/run/spire/oidc-cache"
-    }
-
-    # Serve on plain HTTP (no TLS) for intra-cluster communication.
-    listen_socket_path = ""
 
 ---
 # ── PVC: SPIRE Server persistent data ────────────────────────────────────────
@@ -421,9 +427,8 @@ spec:
           args:
             - "-config"
             - "/run/spire/oidc-config/oidc-discovery-provider.conf"
-            # insecure = serve plain HTTP (no TLS cert required)
-            # Appropriate because traffic stays within the Kubernetes cluster.
-            - "-insecure"
+            # No -insecure flag in SPIRE 1.9.x — HTTP is configured via
+            # insecure_addr in the config file (see ConfigMap above).
           ports:
             - name: oidc
               containerPort: 8008

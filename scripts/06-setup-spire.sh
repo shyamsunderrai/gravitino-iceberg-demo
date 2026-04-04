@@ -402,9 +402,11 @@ echo " Phase 6: Upgrading Gravitino with OAuth2 + RBAC"
 echo "════════════════════════════════════════════════════════════════════════════"
 
 info "Upgrading Gravitino Helm release with SPIRE OAuth2 configuration..."
+# --reuse-values preserves all existing config (S3, HMS, persistence, etc.)
+# The SPIRE values file overlays ONLY auth/authz settings on top.
 helm upgrade gravitino "${CHARTS_DIR}/gravitino" \
   -n "${NAMESPACE}" \
-  -f "${DEPLOY_DIR}/03-gravitino-values.yaml" \
+  --reuse-values \
   -f "${DEPLOY_DIR}/09-gravitino-values-spire.yaml" \
   --wait \
   --timeout 120s

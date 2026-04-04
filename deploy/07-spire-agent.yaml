@@ -139,6 +139,12 @@ data:
       data_dir = "/run/spire/agent-data"
 
       log_level = "INFO"
+
+      # insecure_bootstrap: trust the first bundle received from the server.
+      # In production you would pre-provision the server's CA certificate as
+      # the trust_bundle_path so the agent can verify the server's identity
+      # before accepting its bundle. For demo use, insecure_bootstrap is fine.
+      insecure_bootstrap = true
     }
 
     plugins {
@@ -185,11 +191,15 @@ data:
       }
 
       # ── KeyManager ─────────────────────────────────────────────────────────
-      # Where the Agent stores its own private key (used for its node SVID).
-      # "memory" is ephemeral — the key is regenerated on restart (triggers
-      # re-attestation). This is fine for a demo; in production use "disk".
-      KeyManager "memory" {
-        plugin_data {}
+      # "disk" persists the agent's private key across restarts.
+      # This is important because the key determines the agent's SPIFFE ID
+      # (via the k8s_sat UID). With "memory", every restart generates a new
+      # key → new agent SPIFFE ID → workload entries need re-registration.
+      # With "disk", the same SPIFFE ID is reused → workload entries stay valid.
+      KeyManager "disk" {
+        plugin_data {
+          directory = "/run/spire/agent-data"
+        }
       }
     }
 
@@ -234,6 +244,19 @@ spec:
       # hostPID allows the Agent to resolve a workload's PID to its cgroup/pod.
       # Without this, k8s workload attestation cannot map PIDs to pods.
       hostPID: true
+
+      # hostNetwork: true — the agent shares the node's network namespace.
+      # This makes 127.0.0.1:10250 resolve to the kubelet's loopback address
+      # (not the pod's loopback). The k8s workload attestor calls the kubelet
+      # API at https://127.0.0.1:10250/pods to identify which pod a calling
+      # PID belongs to. Without this, the agent is in its own network namespace
+      # and 127.0.0.1 refers only to itself.
+      hostNetwork: true
+
+      # ClusterFirstWithHostNet: use cluster DNS (kube-dns) even with hostNetwork.
+      # Without this, the pod inherits the node's DNS config and cannot resolve
+      # Kubernetes service names like spire-server.gravitino.svc.cluster.local.
+      dnsPolicy: ClusterFirstWithHostNet
 
       initContainers:
         - name: init-dirs
@@ -302,7 +325,12 @@ spec:
               - serviceAccountToken:
                   path: token
                   expirationSeconds: 7200
-                  audience: "spiffe://gravitino.demo"
+                  # No custom audience — use the default k8s API server audience.
+                  # A custom audience like "spiffe://gravitino.demo" causes the
+                  # TokenReview API to reject the token unless the SPIRE Server
+                  # explicitly specifies that audience in its TokenReview request.
+                  # The default audience is accepted by Kubernetes TokenReview
+                  # and is correct for k8s_sat node attestation.
         # hostPath socket directory — this is how the Agent socket is shared
         # with workload pods. The path /run/spire/sockets is created on the
         # node by the initContainer, then workload pods mount the same path
@@ -316,5 +344,11 @@ spec:
           hostPath:
             path: /run/spire/sockets
             type: DirectoryOrCreate
+        # hostPath for agent data: persists the private key across pod restarts.
+        # With emptyDir the key is lost on restart → agent re-attests → new
+        # SPIFFE ID → workload entries need to be re-registered. hostPath
+        # survives pod restarts (same node) and keeps the SPIFFE ID stable.
         - name: agent-data
-          emptyDir: {}
+          hostPath:
+            path: /run/spire/agent-data
+            type: DirectoryOrCreate
