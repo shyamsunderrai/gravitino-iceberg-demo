@@ -70,10 +70,12 @@ metadata:
 ---
 # ── ClusterRole: node attestation permissions ─────────────────────────────────
 # SPIRE Server must call the Kubernetes API to attest SPIRE Agents via the
-# k8s_sat plugin. Specifically it needs:
+# k8s_psat plugin. Specifically it needs:
 #   • TokenReview — verify a ServiceAccount token a SPIRE Agent presents
 #   • nodes get/list — identify which physical node the agent runs on
-# ClusterRole is needed because nodes are cluster-scoped (not namespaced).
+#   • pods get/list/watch — k8s_psat looks up the agent pod to verify it
+#     belongs to the allowed service_account_allow_list ("gravitino:spire-agent")
+# ClusterRole is needed because nodes/pods can be cluster-scoped lookups.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -82,6 +84,9 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
@@ -214,26 +219,35 @@ data:
       }
 
       # ── NodeAttestor ───────────────────────────────────────────────────────
-      # k8s_sat = Kubernetes Service Account Token attestation.
-      # When a SPIRE Agent starts, it reads a projected ServiceAccount token
-      # and presents it to the server. The server verifies it via the k8s
-      # TokenReview API. On success, the agent receives an SVID and is trusted.
-      NodeAttestor "k8s_sat" {
+      # k8s_psat = Kubernetes Projected Service Account Token attestation.
+      # This is the RECOMMENDED replacement for the deprecated k8s_sat plugin.
+      #
+      # WHY k8s_psat INSTEAD OF k8s_sat:
+      #   k8s_sat derives the node ID from the agent pod's UID, which changes
+      #   every time the DaemonSet pod restarts (new pod = new UID = new SPIFFE ID
+      #   = workload entries need re-registration). This makes automation painful.
+      #
+      #   k8s_psat derives the node ID from the KUBERNETES NODE NAME, which is
+      #   stable (e.g., "docker-desktop"). The resulting agent SPIFFE ID is:
+      #     spiffe://gravitino.demo/spire/agent/k8s_psat/gravitino-demo/docker-desktop
+      #   This never changes, so workload entry parent IDs stay valid forever.
+      #
+      # HOW k8s_psat ATTESTATION WORKS:
+      #   1. Agent presents a projected ServiceAccount token with audience "spire"
+      #   2. Server calls Kubernetes TokenReview API with that audience
+      #   3. Server reads the node name from the TokenReview response
+      #   4. Server verifies the agent's ServiceAccount is in allow_list
+      #   5. Server issues SVID: spiffe://gravitino.demo/spire/agent/k8s_psat/<cluster>/<node-name>
+      NodeAttestor "k8s_psat" {
         plugin_data {
           clusters = {
-            # "gravitino-demo" is an arbitrary label for this k8s cluster.
-            # SPIRE uses it internally to track which cluster an agent belongs to.
             "gravitino-demo" = {
-              # The SPIRE Agent's ServiceAccount. The server checks that the
-              # token belongs to this ServiceAccount (not just any token).
+              # Only tokens belonging to this ServiceAccount are accepted.
               service_account_allow_list = ["gravitino:spire-agent"]
 
-              # The server fetches this token from the Kubernetes API during
-              # attestation. Must match the projected volume in the Agent pod.
-              use_token_review_api_validation = true
-
-              # audience not set — use the default Kubernetes API server audience.
-              # The projected token in the Agent pod spec has no custom audience.
+              # The audience the projected token must carry.
+              # Must match the audience in the Agent's projected volume spec.
+              audience = ["spire"]
             }
           }
         }

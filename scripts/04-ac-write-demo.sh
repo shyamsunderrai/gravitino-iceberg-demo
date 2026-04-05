@@ -268,10 +268,11 @@ kubectl run "${POD_NAME}" \
     \"spec\": {
       \"initContainers\": [{
         \"name\": \"fetch-spire-jwt\",
-        \"image\": \"ghcr.io/spiffe/spire-agent:1.9.6\",
+        \"image\": \"busybox:1.36\",
         \"command\": [\"sh\", \"-c\",
-          \"/opt/spire/bin/spire-agent api fetch jwt -audience gravitino -socketPath /run/spire/sockets/agent.sock 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1 > /run/spire/jwt/token && echo '[SPIFFE] JWT-SVID written to /run/spire/jwt/token' && wc -c /run/spire/jwt/token || (echo '[SPIFFE] WARNING: Could not fetch JWT. SPIRE may not be deployed.' && touch /run/spire/jwt/token)\"],
+          \"/jars/spire-agent api fetch jwt -audience gravitino -socketPath /run/spire/sockets/agent.sock 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1 > /run/spire/jwt/token && echo '[SPIFFE] JWT-SVID written' && wc -c /run/spire/jwt/token || (echo '[SPIFFE] WARNING: JWT fetch failed' && touch /run/spire/jwt/token)\"],
         \"volumeMounts\": [
+          {\"name\": \"jars\",        \"mountPath\": \"/jars\"},
           {\"name\": \"spire-socket\", \"mountPath\": \"/run/spire/sockets\"},
           {\"name\": \"jwt-dir\",      \"mountPath\": \"/run/spire/jwt\"}
         ]

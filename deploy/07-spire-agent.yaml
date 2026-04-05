@@ -149,18 +149,13 @@ data:
 
     plugins {
       # ── NodeAttestor ───────────────────────────────────────────────────────
-      # The Agent's side of k8s_sat attestation.
-      # It reads a projected ServiceAccount token and presents it to the Server.
-      #
-      # token_path: The projected token is automatically mounted here by
-      # Kubernetes (see the volumeProjection in the DaemonSet spec below).
-      # This is NOT the default ServiceAccount token — it's a projected token
-      # with a specific audience, making it usable only for SPIRE attestation.
-      NodeAttestor "k8s_sat" {
+      # k8s_psat: presents a projected ServiceAccount token to the SPIRE Server.
+      # The server validates it via TokenReview and derives the node name → stable
+      # agent SPIFFE ID: spiffe://gravitino.demo/spire/agent/k8s_psat/gravitino-demo/<node-name>
+      NodeAttestor "k8s_psat" {
         plugin_data {
-          # Must match the cluster name registered in the server's NodeAttestor config.
-          cluster      = "gravitino-demo"
-          token_path   = "/run/spire/token"
+          cluster    = "gravitino-demo"
+          token_path = "/run/spire/token"
         }
       }
 
@@ -325,12 +320,11 @@ spec:
               - serviceAccountToken:
                   path: token
                   expirationSeconds: 7200
-                  # No custom audience — use the default k8s API server audience.
-                  # A custom audience like "spiffe://gravitino.demo" causes the
-                  # TokenReview API to reject the token unless the SPIRE Server
-                  # explicitly specifies that audience in its TokenReview request.
-                  # The default audience is accepted by Kubernetes TokenReview
-                  # and is correct for k8s_sat node attestation.
+                  # audience "spire" — must match the audience list in the server's
+                  # k8s_psat cluster config. The Kubernetes TokenReview API will
+                  # only validate this token when the request includes "spire"
+                  # as the expected audience, preventing token reuse for other services.
+                  audience: "spire"
         # hostPath socket directory — this is how the Agent socket is shared
         # with workload pods. The path /run/spire/sockets is created on the
         # node by the initContainer, then workload pods mount the same path

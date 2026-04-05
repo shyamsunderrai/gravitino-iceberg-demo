@@ -36,6 +36,8 @@ set -euo pipefail
 
 NAMESPACE="gravitino"
 METALAKE="poc_layer"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+JAR_DIR="$(cd "${SCRIPT_DIR}/../jars" && pwd)"
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -46,6 +48,7 @@ PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
 pass() { echo -e "${PASS} $*"; (( PASS_COUNT++ )) || true; }
 fail() { echo -e "${FAIL} $*"; (( FAIL_COUNT++ )) || true; }
 skip() { echo -e "${YELLOW}[SKIP]${NC} $*"; (( SKIP_COUNT++ )) || true; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════════════"
@@ -53,11 +56,11 @@ echo " SPIFFE + Gravitino RBAC Policy Validation"
 echo "════════════════════════════════════════════════════════════════════════════"
 
 # ── Port-forward to Gravitino ─────────────────────────────────────────────────
-kubectl port-forward svc/gravitino 18090:18090 -n "${NAMESPACE}" &
+kubectl port-forward svc/gravitino 8090:8090 -n "${NAMESPACE}" &
 PF_PID=$!
 trap "kill ${PF_PID} 2>/dev/null || true" EXIT
 sleep 3
-GRAVITINO_URL="http://localhost:18090"
+GRAVITINO_URL="http://localhost:8090"
 
 # ── Helper: fetch JWT-SVID for a given workload label ─────────────────────────
 # Runs a temporary pod with the given label, waits for SPIRE to attest it,
@@ -70,35 +73,40 @@ fetch_jwt() {
   local pod_name="$1"
   local workload_label="$2"
 
-  kubectl delete pod "${pod_name}" -n "${NAMESPACE}" --ignore-not-found --wait=false 2>/dev/null
+  kubectl delete pod "${pod_name}" -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
-  local jwt
-  jwt=$(kubectl run "${pod_name}" \
-    --image=ghcr.io/spiffe/spire-agent:1.9.6 \
+  kubectl run "${pod_name}" \
+    --image=busybox:1.36 \
     --restart=Never \
-    --rm \
     -n "${NAMESPACE}" \
     -l "spiffe-workload=${workload_label}" \
     --overrides="{
       \"spec\": {
         \"containers\": [{
           \"name\": \"${pod_name}\",
-          \"image\": \"ghcr.io/spiffe/spire-agent:1.9.6\",
-          \"command\": [\"/opt/spire/bin/spire-agent\", \"api\", \"fetch\", \"jwt\",
-                       \"-audience\", \"gravitino\",
-                       \"-socketPath\", \"/run/spire/sockets/agent.sock\"],
-          \"volumeMounts\": [{
-            \"name\": \"spire-socket\",
-            \"mountPath\": \"/run/spire/sockets\"
-          }]
+          \"image\": \"busybox:1.36\",
+          \"command\": [\"sh\", \"-c\",
+            \"/jars/spire-agent api fetch jwt -audience gravitino -socketPath /run/spire/sockets/agent.sock 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1\"],
+          \"volumeMounts\": [
+            {\"name\": \"jars\",        \"mountPath\": \"/jars\"},
+            {\"name\": \"spire-socket\", \"mountPath\": \"/run/spire/sockets\"}
+          ]
         }],
-        \"volumes\": [{
-          \"name\": \"spire-socket\",
-          \"hostPath\": {\"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}
-        }]
+        \"volumes\": [
+          {\"name\": \"jars\",   \"hostPath\": {\"path\": \"${JAR_DIR}\"}},
+          {\"name\": \"spire-socket\", \"hostPath\": {\"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}}
+        ]
       }
-    }" -i --quiet 2>/dev/null | \
-    grep -oP 'token\(spiffe://[^)]+\):\s*\K[A-Za-z0-9._-]+' | head -1)
+    }" > /dev/null 2>&1
+
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/"${pod_name}" \
+    -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
+
+  local jwt
+  jwt=$(kubectl logs "${pod_name}" -n "${NAMESPACE}" 2>/dev/null | \
+    grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1)
+
+  kubectl delete pod "${pod_name}" -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
   echo "${jwt}"
 }
@@ -267,13 +275,19 @@ echo "   Expected: TCP timeout/refused — NetworkPolicy blocks non-Gravitino po
 echo "   NOTE: Only enforced on Calico/Cilium CNI. kindnet (Docker Desktop) = SKIP"
 
 # Check if NetworkPolicy is actually enforced by testing a canary pod
-BYPASS_RESULT=$(kubectl run oc-hms-bypass-test \
+kubectl delete pod oc-hms-bypass-test -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+kubectl run oc-hms-bypass-test \
   --image=busybox:1.36 \
   --restart=Never \
-  --rm \
   -n "${NAMESPACE}" \
   --overrides='{"spec":{"containers":[{"name":"test","image":"busybox:1.36","command":["sh","-c","timeout 3 nc -z hive-metastore 9083 && echo CONNECTED || echo BLOCKED"]}]}}' \
-  -i --quiet 2>/dev/null | tail -1 || echo "ERROR")
+  > /dev/null 2>&1
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/oc-hms-bypass-test \
+  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || \
+kubectl wait --for=jsonpath='{.status.phase}'=Failed pod/oc-hms-bypass-test \
+  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
+BYPASS_RESULT=$(kubectl logs oc-hms-bypass-test -n "${NAMESPACE}" 2>/dev/null | tail -1 || echo "ERROR")
+kubectl delete pod oc-hms-bypass-test -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
 case "${BYPASS_RESULT}" in
   "BLOCKED")
@@ -300,14 +314,20 @@ echo ""
 echo "── Test 6: ac_writer direct AC-HMS access (should be ALLOWED) ────────────"
 echo "   Expected: TCP connection succeeds — NetworkPolicy allows spark-ac-writer"
 
-AC_HMS_RESULT=$(kubectl run ac-hms-access-test \
+kubectl delete pod ac-hms-access-test -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+kubectl run ac-hms-access-test \
   --image=busybox:1.36 \
   --restart=Never \
-  --rm \
   -n "${NAMESPACE}" \
   -l "spiffe-workload=spark-ac-writer" \
   --overrides='{"spec":{"containers":[{"name":"test","image":"busybox:1.36","command":["sh","-c","timeout 3 nc -z hive-metastore-analytics 9083 && echo CONNECTED || echo BLOCKED"]}]}}' \
-  -i --quiet 2>/dev/null | tail -1 || echo "ERROR")
+  > /dev/null 2>&1
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/ac-hms-access-test \
+  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || \
+kubectl wait --for=jsonpath='{.status.phase}'=Failed pod/ac-hms-access-test \
+  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
+AC_HMS_RESULT=$(kubectl logs ac-hms-access-test -n "${NAMESPACE}" 2>/dev/null | tail -1 || echo "ERROR")
+kubectl delete pod ac-hms-access-test -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
 case "${AC_HMS_RESULT}" in
   "CONNECTED")

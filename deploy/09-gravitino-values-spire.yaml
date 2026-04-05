@@ -88,14 +88,23 @@ authenticator:
     # from the discovery doc (which would fail since we serve HTTP not HTTPS).
     jwksUri: "http://spire-oidc.gravitino.svc.cluster.local:8008/keys"
 
-    # Provider type hint. Leave empty for custom OIDC (SPIRE).
-    provider: ""
+    # Provider type for the Gravitino Web UI OAuth sign-in flow.
+    # Must be "default" or "oidc". Since we're not using the Web UI OAuth flow
+    # (our workloads authenticate via Bearer JWT from the Workload API, not via UI),
+    # use "default". This doesn't affect backend JWT validation — that's handled
+    # entirely by JwksTokenValidator + jwksUri.
+    provider: "default"
 
     # Not needed for SPIRE integration:
     clientId: ""
     authority: ""
     scope: ""
-    tokenValidatorClass: ""
+
+    # JwksTokenValidator: fetches SPIRE's RS256/ES256 public keys from jwksUri,
+    # validates JWT signatures dynamically (key rotation works automatically).
+    # StaticSignKeyValidator (the default) only supports HMAC with a static key,
+    # which is incompatible with SPIRE's asymmetric JWT signing.
+    tokenValidatorClass: "org.apache.gravitino.server.authentication.JwksTokenValidator"
 
     # The JWT claim to use as the principal (user identity) in Gravitino RBAC.
     # "sub" is the standard SPIFFE claim containing the SPIFFE ID:
@@ -114,6 +123,39 @@ authorization:
   # When a request arrives with JWT sub=spiffe://gravitino.demo/admin,
   # it has full administrative access regardless of RBAC rules.
   serviceAdmins: "spiffe://gravitino.demo/admin"
+
+# ── Iceberg REST: dynamic catalog config provider ────────────────────────────
+# When authorization.enable=true, Gravitino requires the Iceberg REST service
+# to use dynamic-config-provider so it can propagate the auth context (Bearer
+# token) from the incoming Spark request through to the catalog backend.
+# Without this, Gravitino throws:
+#   "Authorization is enabled. Set catalog-config-provider=dynamic-config-provider"
+icebergRest:
+  catalogConfigProvider: "dynamic-config-provider"
+  dynamicConfigProvider:
+    uri: "http://localhost:8090"
+    metalake: "poc_layer"
+    defaultCatalogName: "oc_iceberg"
+
+# ── Environment variables for AWS SDK v2 region discovery ───────────────────
+# With dynamic-config-provider, Gravitino's Iceberg REST creates S3FileIO
+# instances using catalog-registered S3 credentials. AWS SDK v2 (used by
+# iceberg-aws) requires a region — either via s3.region property or via
+# the AWS_REGION environment variable. Set it here to satisfy SeaweedFS S3.
+env:
+  - name: GRAVITINO_HOME
+    value: /root/gravitino
+  - name: GRAVITINO_MEM
+    value: "-Xms1024m -Xmx1024m -XX:MaxMetaspaceSize=512m"
+  - name: AWS_REGION
+    value: "us-east-1"
+  - name: AWS_ACCESS_KEY_ID
+    value: "admin"
+  - name: AWS_SECRET_ACCESS_KEY
+    value: "admin"
+  # AWS SDK v2 endpoint override for SeaweedFS (added in SDK 2.18+)
+  - name: AWS_ENDPOINT_URL_S3
+    value: "http://seaweedfs-filer.gravitino.svc.cluster.local:8333"
 
 # ── Volume mount for SPIRE Agent socket ─────────────────────────────────────
 # Gravitino gets the SPIRE socket so it can request its own SVID if needed

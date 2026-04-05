@@ -74,7 +74,7 @@ set -euo pipefail
 
 NAMESPACE="gravitino"
 METALAKE="poc_layer"
-GRAVITINO_PORT=18090
+GRAVITINO_PORT=8090
 LOCAL_PORT=18090
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
@@ -134,10 +134,10 @@ GRAVITINO_URL="http://localhost:${LOCAL_PORT}"
 #               "iat": <now>}
 
 info "Fetching admin JWT-SVID from SPIRE..."
-ADMIN_JWT=$(kubectl run spire-admin-jwt-fetch \
+kubectl delete pod spire-admin-jwt-fetch -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+kubectl run spire-admin-jwt-fetch \
   --image=ghcr.io/spiffe/spire-agent:1.9.6 \
   --restart=Never \
-  --rm \
   -n "${NAMESPACE}" \
   -l "spiffe-workload=gravitino-admin" \
   --overrides="{
@@ -158,8 +158,13 @@ ADMIN_JWT=$(kubectl run spire-admin-jwt-fetch \
         \"hostPath\": {\"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}
       }]
     }
-  }" -i --quiet 2>/dev/null | \
-  grep -oP 'token\(spiffe://[^)]+\):\s*\K[A-Za-z0-9._-]+' | head -1)
+  }" > /dev/null 2>&1
+# Wait for the pod to complete (max 30 seconds)
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/spire-admin-jwt-fetch \
+  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
+ADMIN_JWT=$(kubectl logs spire-admin-jwt-fetch -n "${NAMESPACE}" 2>/dev/null | \
+  grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1)
+kubectl delete pod spire-admin-jwt-fetch -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
 if [ -z "${ADMIN_JWT}" ]; then
   warn "Could not fetch admin JWT-SVID from SPIRE."
@@ -198,7 +203,7 @@ gravitino_post() {
   fi
 
   http_code=$(echo "${response}" | tail -1)
-  body_out=$(echo "${response}" | head -n -1)
+  body_out=$(echo "${response}" | sed '$d')
 
   case "${http_code}" in
     200|201) echo "${body_out}" ;;
@@ -228,12 +233,37 @@ gravitino_put() {
   fi
 
   http_code=$(echo "${response}" | tail -1)
-  body_out=$(echo "${response}" | head -n -1)
+  body_out=$(echo "${response}" | sed '$d')
 
   case "${http_code}" in
     200|201) echo "${body_out}" ;;
     409) warn "Already exists (409) — skipping" ;;
     *) error "HTTP ${http_code}: ${body_out}"; return 1 ;;
+  esac
+}
+
+gravitino_delete() {
+  local path="$1"
+  local response http_code
+
+  if [ -n "${AUTH_HEADER:-}" ]; then
+    response=$(curl -s -w "\n%{http_code}" \
+      -X DELETE \
+      -H "${AUTH_HEADER}" \
+      "${GRAVITINO_URL}${path}")
+  else
+    response=$(curl -s -w "\n%{http_code}" \
+      -X DELETE \
+      "${GRAVITINO_URL}${path}")
+  fi
+
+  http_code=$(echo "${response}" | tail -1)
+  body_out=$(echo "${response}" | sed '$d')
+
+  case "${http_code}" in
+    200|204) : ;;
+    404) : ;;  # already gone
+    *) warn "DELETE HTTP ${http_code}: ${body_out}" ;;
   esac
 }
 
@@ -252,7 +282,7 @@ for USER in \
 
   info "Registering user: ${USER}"
   gravitino_post "/api/metalakes/${METALAKE}/users" \
-    "{\"name\": \"${USER}\", \"roles\": []}" || true
+    "{\"name\": \"${USER}\"}" || true
 done
 
 success "Users registered"
@@ -273,6 +303,7 @@ echo "── Step 2: Create oc_writer_role ────────────�
 #   tables within that catalog, now and in the future.
 
 info "Creating oc_writer_role..."
+gravitino_delete "/api/metalakes/${METALAKE}/roles/oc_writer_role" || true
 gravitino_post "/api/metalakes/${METALAKE}/roles" '{
   "name": "oc_writer_role",
   "securableObjects": [
@@ -281,6 +312,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
       "fullName": "oc_iceberg",
       "privileges": [
         {"name": "USE_CATALOG",   "condition": "ALLOW"},
+        {"name": "USE_SCHEMA",    "condition": "ALLOW"},
         {"name": "CREATE_SCHEMA", "condition": "ALLOW"},
         {"name": "CREATE_TABLE",  "condition": "ALLOW"},
         {"name": "MODIFY_TABLE",  "condition": "ALLOW"},
@@ -292,6 +324,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
       "fullName": "hive_metastore_analytics",
       "privileges": [
         {"name": "USE_CATALOG",  "condition": "ALLOW"},
+        {"name": "USE_SCHEMA",   "condition": "ALLOW"},
         {"name": "SELECT_TABLE", "condition": "ALLOW"}
       ]
     }
@@ -306,6 +339,7 @@ echo "── Step 3: Create ac_writer_role ────────────�
 #   Full write access to analytical, read-only to operational.
 
 info "Creating ac_writer_role..."
+gravitino_delete "/api/metalakes/${METALAKE}/roles/ac_writer_role" || true
 gravitino_post "/api/metalakes/${METALAKE}/roles" '{
   "name": "ac_writer_role",
   "securableObjects": [
@@ -314,6 +348,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
       "fullName": "hive_metastore_analytics",
       "privileges": [
         {"name": "USE_CATALOG",   "condition": "ALLOW"},
+        {"name": "USE_SCHEMA",    "condition": "ALLOW"},
         {"name": "CREATE_SCHEMA", "condition": "ALLOW"},
         {"name": "CREATE_TABLE",  "condition": "ALLOW"},
         {"name": "MODIFY_TABLE",  "condition": "ALLOW"},
@@ -325,6 +360,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
       "fullName": "oc_iceberg",
       "privileges": [
         {"name": "USE_CATALOG",  "condition": "ALLOW"},
+        {"name": "USE_SCHEMA",   "condition": "ALLOW"},
         {"name": "SELECT_TABLE", "condition": "ALLOW"}
       ]
     }
@@ -338,6 +374,7 @@ echo "── Step 4: Create admin_role ─────────────�
 # Admin gets full metalake-level access (can do everything)
 
 info "Creating admin_role..."
+gravitino_delete "/api/metalakes/${METALAKE}/roles/admin_role" || true
 gravitino_post "/api/metalakes/${METALAKE}/roles" "{
   \"name\": \"admin_role\",
   \"securableObjects\": [
@@ -347,6 +384,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" "{
       \"privileges\": [
         {\"name\": \"MANAGE_USERS\",  \"condition\": \"ALLOW\"},
         {\"name\": \"USE_CATALOG\",   \"condition\": \"ALLOW\"},
+        {\"name\": \"USE_SCHEMA\",    \"condition\": \"ALLOW\"},
         {\"name\": \"CREATE_CATALOG\",\"condition\": \"ALLOW\"},
         {\"name\": \"CREATE_SCHEMA\", \"condition\": \"ALLOW\"},
         {\"name\": \"CREATE_TABLE\",  \"condition\": \"ALLOW\"},
@@ -374,9 +412,13 @@ grant_role() {
   encoded_user=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${user}', safe=''))" 2>/dev/null || \
     echo "${user}" | sed 's|/|%2F|g; s|:|%3A|g')
 
+  # LEARNING NOTE: The Gravitino permissions API uses a separate endpoint path:
+  #   PUT /api/metalakes/{ml}/permissions/users/{user}/grant/
+  #   Body: {"roleNames": ["role1", "role2"]}
+  # (NOT /api/metalakes/{ml}/users/{user}/role which doesn't exist)
   info "Granting ${role} to ${user}..."
-  gravitino_put "/api/metalakes/${METALAKE}/users/${encoded_user}/role" \
-    "{\"rolesToAdd\": [\"${role}\"], \"rolesToRemove\": []}" || true
+  gravitino_put "/api/metalakes/${METALAKE}/permissions/users/${encoded_user}/grant/" \
+    "{\"roleNames\": [\"${role}\"]}" || true
 }
 
 grant_role "spiffe://gravitino.demo/spark-oc-writer" "oc_writer_role"
