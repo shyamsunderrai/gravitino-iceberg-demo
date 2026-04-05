@@ -146,7 +146,6 @@ df_ranked.createOrReplaceTempView("ranked_data")
 print(f"=== [3/4] Creating destination table {dst_full} (if not exists) ===")
 print(f"    (WRITE path: Spark → AC-HMS Thrift directly)")
 print(f"    (Auth: NetworkPolicy allows pod label spiffe-workload=spark-ac-writer)")
-spark.sql(f"CREATE DATABASE IF NOT EXISTS `{dst_catalog}`.{db}")
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {dst_full} (
         sensor_id   INT,
@@ -189,14 +188,30 @@ cat > "${WRAPPER_FILE}" << WRAPEOF
 set -e
 
 JWT_FILE="/run/spire/jwt/token"
+JWT_SECRET_FILE="/run/spire/jwt-secret/token"
 JWT_TOKEN=""
 
-if [ -f "\${JWT_FILE}" ] && [ -s "\${JWT_FILE}" ]; then
+# Priority: pre-minted Secret (Docker Desktop workaround) → workload API
+if [ -f "\${JWT_SECRET_FILE}" ] && [ -s "\${JWT_SECRET_FILE}" ]; then
+    JWT_TOKEN=\$(cat "\${JWT_SECRET_FILE}")
+    echo "[SPIFFE] JWT-SVID loaded from pre-minted Secret (server-side mint)"
+    echo "[SPIFFE] First 60 chars of token: \$(echo \${JWT_TOKEN} | cut -c1-60)..."
+elif [ -f "\${JWT_FILE}" ] && [ -s "\${JWT_FILE}" ]; then
     JWT_TOKEN=\$(cat "\${JWT_FILE}")
-    echo "[SPIFFE] JWT-SVID loaded — identity: spiffe://gravitino.demo/spark-ac-writer"
-    echo "[SPIFFE] Token (first 60 chars): \$(echo \${JWT_TOKEN} | cut -c1-60)..."
+    echo "[SPIFFE] JWT-SVID loaded from workload API at \${JWT_FILE}"
+    echo "[SPIFFE] First 60 chars of token: \$(echo \${JWT_TOKEN} | cut -c1-60)..."
 else
-    echo "[SPIFFE] WARNING: No JWT-SVID found. SPIRE may not be deployed."
+    echo "[SPIFFE] WARNING: No JWT-SVID found at either source"
+    echo "[SPIFFE] Running without authentication token."
+fi
+
+# Only pass token conf when non-empty — an empty Bearer token causes 401.
+TOKEN_CONF=""
+if [ -n "\${JWT_TOKEN}" ]; then
+    TOKEN_CONF="--conf spark.sql.catalog.oc_iceberg.token=\${JWT_TOKEN}"
+    echo "[SPIFFE] Running Spark with SPIFFE Bearer token."
+else
+    echo "[SPIFFE] Running Spark without auth token (no SPIRE or token empty)."
 fi
 
 # ── Two catalogs, two auth models ─────────────────────────────────────────────
@@ -213,29 +228,56 @@ fi
 #
 exec /opt/spark/bin/spark-submit \\
   --master local[*] \\
-  --jars /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-java-sdk-bundle-1.12.262.jar \\
-  --driver-class-path /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-java-sdk-bundle-1.12.262.jar \\
+  --jars /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-sdk-java-bundle-2.26.20.jar \\
+  --driver-class-path /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-sdk-java-bundle-2.26.20.jar \\
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \\
   --conf spark.sql.warehouse.dir=/tmp/spark-warehouse \\
   --conf spark.sql.catalog.oc_iceberg=org.apache.iceberg.spark.SparkCatalog \\
   --conf spark.sql.catalog.oc_iceberg.type=rest \\
   --conf spark.sql.catalog.oc_iceberg.uri=http://gravitino.gravitino.svc.cluster.local:9001/iceberg \\
-  --conf spark.sql.catalog.oc_iceberg.io-impl=org.apache.iceberg.hadoop.HadoopFileIO \\
-  --conf "spark.sql.catalog.oc_iceberg.token=\${JWT_TOKEN}" \\
+  --conf spark.sql.catalog.oc_iceberg.s3.access-key-id=admin \\
+  --conf spark.sql.catalog.oc_iceberg.s3.secret-access-key=admin \\
+  --conf spark.sql.catalog.oc_iceberg.s3.endpoint=http://seaweedfs-filer.gravitino.svc.cluster.local:8333 \\
+  --conf spark.sql.catalog.oc_iceberg.s3.path-style-access=true \\
+  \${TOKEN_CONF} \\
   --conf spark.sql.catalog.ac_iceberg=org.apache.iceberg.spark.SparkCatalog \\
   --conf spark.sql.catalog.ac_iceberg.type=hive \\
   --conf spark.sql.catalog.ac_iceberg.uri=thrift://hive-metastore-analytics.gravitino.svc.cluster.local:9083 \\
-  --conf spark.sql.catalog.ac_iceberg.warehouse=s3a://analytical/iceberg-warehouse \\
-  --conf spark.sql.catalog.ac_iceberg.io-impl=org.apache.iceberg.hadoop.HadoopFileIO \\
-  --conf spark.hadoop.fs.s3a.endpoint=http://seaweedfs-filer.gravitino.svc.cluster.local:8333 \\
-  --conf spark.hadoop.fs.s3a.access.key=admin \\
-  --conf spark.hadoop.fs.s3a.secret.key=admin \\
-  --conf spark.hadoop.fs.s3a.path.style.access=true \\
-  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \\
-  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \\
-  --conf spark.hadoop.fs.s3a.fast.upload=true \\
+  --conf spark.sql.catalog.ac_iceberg.warehouse=s3://analytical/iceberg-warehouse \\
+  --conf spark.sql.catalog.ac_iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO \\
+  --conf spark.sql.catalog.ac_iceberg.s3.access-key-id=admin \\
+  --conf spark.sql.catalog.ac_iceberg.s3.secret-access-key=admin \\
+  --conf spark.sql.catalog.ac_iceberg.s3.endpoint=http://seaweedfs-filer.gravitino.svc.cluster.local:8333 \\
+  --conf spark.sql.catalog.ac_iceberg.s3.path-style-access=true \\
+  --conf spark.sql.catalog.ac_iceberg.client.region=us-east-1 \\
   /script/spark-demo.py
 WRAPEOF
+
+# ── Pre-flight: clean stale AC-HMS entries + ensure schemas exist ─────────────
+# NOTE: Do NOT clean OC-HMS here — sensor_readings was written by 03-iceberg-write-demo.sh
+# and is needed for the READ step. Only clean AC-HMS to remove stale table entries.
+echo "[0/4] Pre-flight: cleaning stale AC-HMS entries and ensuring schemas..."
+kubectl exec -n "${NAMESPACE}" deployment/hive-metastore-analytics-mysql -- \
+  mysql -uroot -phiveroot hive_metastore -e "
+    SET FOREIGN_KEY_CHECKS=0;
+    DELETE FROM TABLE_PARAMS WHERE TBL_ID IN (
+      SELECT TBL_ID FROM TBLS WHERE DB_ID IN (
+        SELECT DB_ID FROM DBS WHERE NAME='poc_demo'));
+    DELETE FROM TBLS WHERE DB_ID IN (SELECT DB_ID FROM DBS WHERE NAME='poc_demo');
+    DELETE FROM DBS WHERE NAME='poc_demo';
+    SET FOREIGN_KEY_CHECKS=1;
+  " 2>/dev/null || true
+
+# Create poc_demo schema in AC-HMS via Gravitino management API
+# Catalog name in Gravitino is "AC-HMS" (as registered in 02-register-catalogs.sh)
+kubectl port-forward -n "${NAMESPACE}" svc/gravitino 18090:8090 &>/dev/null &
+PF_PID=$!
+sleep 3
+curl -s -o /dev/null -X POST \
+  "http://localhost:18090/api/metalakes/poc_layer/catalogs/AC-HMS/schemas" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"poc_demo","comment":"Demo schema","properties":{}}' || true
+kill "${PF_PID}" 2>/dev/null || true
 
 # ── Deploy and run ────────────────────────────────────────────────────────────
 echo "[1/4] Updating ConfigMap '${CONFIGMAP_NAME}'..."
@@ -249,6 +291,32 @@ echo "[2/4] Cleaning up previous pod..."
 kubectl delete pod "${POD_NAME}" -n "${NAMESPACE}" --ignore-not-found
 
 echo "[3/4] Submitting Spark job with SPIFFE identity: spark-ac-writer..."
+
+# ── Pre-mint JWT via SPIRE Server (Docker Desktop workaround) ─────────────────
+SPIRE_SERVER_POD=$(kubectl get pod -n "${NAMESPACE}" -l app=spire-server \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+PRE_MINTED_JWT=""
+if [ -n "${SPIRE_SERVER_POD}" ]; then
+  PRE_MINTED_JWT=$(kubectl exec -n "${NAMESPACE}" "${SPIRE_SERVER_POD}" -c spire-server -- \
+    /opt/spire/bin/spire-server jwt mint \
+    -spiffeID spiffe://gravitino.demo/spark-ac-writer \
+    -audience gravitino \
+    -socketPath /run/spire/sockets/server.sock 2>/dev/null | tr -d '\n') || PRE_MINTED_JWT=""
+fi
+
+kubectl delete secret ac-writer-jwt -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+if [ -n "${PRE_MINTED_JWT}" ]; then
+  kubectl create secret generic ac-writer-jwt \
+    --from-literal=token="${PRE_MINTED_JWT}" \
+    -n "${NAMESPACE}" > /dev/null 2>&1
+  echo "    [SPIFFE] Pre-minted JWT injected via Secret (Docker Desktop workaround)"
+  echo "    [SPIFFE] Identity: spiffe://gravitino.demo/spark-ac-writer"
+else
+  kubectl create secret generic ac-writer-jwt \
+    --from-literal=token="" \
+    -n "${NAMESPACE}" > /dev/null 2>&1
+  echo "    [SPIFFE] No SPIRE Server found — Spark will run without auth token"
+fi
 
 # ── Pod label: spiffe-workload=spark-ac-writer ────────────────────────────────
 # Two effects of this label:
@@ -285,7 +353,9 @@ kubectl run "${POD_NAME}" \
           {\"name\": \"jars\",         \"mountPath\": \"/jars\"},
           {\"name\": \"script\",       \"mountPath\": \"/script\"},
           {\"name\": \"spire-socket\", \"mountPath\": \"/run/spire/sockets\"},
-          {\"name\": \"jwt-dir\",      \"mountPath\": \"/run/spire/jwt\"}
+          {\"name\": \"jwt-dir\",      \"mountPath\": \"/run/spire/jwt\"},
+          {\"name\": \"jwt-secret\",   \"mountPath\": \"/run/spire/jwt-secret\",
+           \"readOnly\": true}
         ]
       }],
       \"volumes\": [
@@ -294,7 +364,8 @@ kubectl run "${POD_NAME}" \
           \"defaultMode\": 493}},
         {\"name\": \"spire-socket\", \"hostPath\": {
           \"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}},
-        {\"name\": \"jwt-dir\", \"emptyDir\": {}}
+        {\"name\": \"jwt-dir\", \"emptyDir\": {}},
+        {\"name\": \"jwt-secret\", \"secret\": {\"secretName\": \"ac-writer-jwt\"}}
       ]
     }
   }"

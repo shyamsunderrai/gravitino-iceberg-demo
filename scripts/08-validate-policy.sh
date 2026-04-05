@@ -62,53 +62,27 @@ trap "kill ${PF_PID} 2>/dev/null || true" EXIT
 sleep 3
 GRAVITINO_URL="http://localhost:8090"
 
-# ── Helper: fetch JWT-SVID for a given workload label ─────────────────────────
-# Runs a temporary pod with the given label, waits for SPIRE to attest it,
-# fetches the JWT-SVID, then returns the token string.
+# ── Helper: mint JWT-SVID for a given SPIFFE ID via SPIRE Server ──────────────
+# On Docker Desktop, the SPIRE Agent's k8s WorkloadAttestor cannot resolve
+# PIDs to container IDs (cgroup path format mismatch with containerd).
+# Instead, we mint JWTs directly from the SPIRE Server — a privileged operation
+# that is valid for policy validation scripts.
 #
 # Parameters:
-#   $1 = pod name (must be unique)
-#   $2 = spiffe-workload label value (e.g., "spark-oc-writer")
-fetch_jwt() {
-  local pod_name="$1"
-  local workload_label="$2"
+#   $1 = SPIFFE ID (e.g., "spiffe://gravitino.demo/spark-oc-writer")
+SPIRE_SERVER_POD=$(kubectl get pod -n "${NAMESPACE}" -l app=spire-server \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
-  kubectl delete pod "${pod_name}" -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+mint_jwt() {
+  local spiffe_id="$1"
 
-  kubectl run "${pod_name}" \
-    --image=busybox:1.36 \
-    --restart=Never \
-    -n "${NAMESPACE}" \
-    -l "spiffe-workload=${workload_label}" \
-    --overrides="{
-      \"spec\": {
-        \"containers\": [{
-          \"name\": \"${pod_name}\",
-          \"image\": \"busybox:1.36\",
-          \"command\": [\"sh\", \"-c\",
-            \"/jars/spire-agent api fetch jwt -audience gravitino -socketPath /run/spire/sockets/agent.sock 2>/dev/null | grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1\"],
-          \"volumeMounts\": [
-            {\"name\": \"jars\",        \"mountPath\": \"/jars\"},
-            {\"name\": \"spire-socket\", \"mountPath\": \"/run/spire/sockets\"}
-          ]
-        }],
-        \"volumes\": [
-          {\"name\": \"jars\",   \"hostPath\": {\"path\": \"${JAR_DIR}\"}},
-          {\"name\": \"spire-socket\", \"hostPath\": {\"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}}
-        ]
-      }
-    }" > /dev/null 2>&1
+  [ -z "${SPIRE_SERVER_POD}" ] && echo "" && return
 
-  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/"${pod_name}" \
-    -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
-
-  local jwt
-  jwt=$(kubectl logs "${pod_name}" -n "${NAMESPACE}" 2>/dev/null | \
-    grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1)
-
-  kubectl delete pod "${pod_name}" -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
-
-  echo "${jwt}"
+  kubectl exec -n "${NAMESPACE}" "${SPIRE_SERVER_POD}" -c spire-server -- \
+    /opt/spire/bin/spire-server jwt mint \
+    -spiffeID "${spiffe_id}" \
+    -audience gravitino \
+    -socketPath /run/spire/sockets/server.sock 2>/dev/null | tr -d '\n' || echo ""
 }
 
 # ── Helper: call Gravitino API and check expected HTTP code ───────────────────
@@ -193,19 +167,19 @@ echo ""
 echo "── Test 2: oc_writer attempts WRITE to analytical catalog ───────────────"
 echo "   Expected: 403 Forbidden — oc_writer has only READ access to AC catalog"
 
-echo -e "${INFO} Fetching JWT-SVID for spark-oc-writer..."
-OC_JWT=$(fetch_jwt "validate-oc-writer" "spark-oc-writer")
+echo -e "${INFO} Minting JWT-SVID for spark-oc-writer..."
+OC_JWT=$(mint_jwt "spiffe://gravitino.demo/spark-oc-writer")
 
 if [ -z "${OC_JWT}" ]; then
-  skip "Test 2: Could not fetch oc_writer JWT (SPIRE may not be ready) — skipping"
+  skip "Test 2: Could not mint oc_writer JWT (SPIRE may not be ready) — skipping"
 else
   echo -e "${INFO} JWT obtained for spiffe://gravitino.demo/spark-oc-writer"
 
-  # Try to create a table in the analytical catalog — should be denied
+  # Try to create a table in the analytical catalog (AC-HMS) — should be denied
   check_http \
-    "oc_writer CREATE TABLE in hive_metastore_analytics" \
+    "oc_writer CREATE TABLE in AC-HMS (write denied)" \
     "403" "POST" \
-    "/api/metalakes/${METALAKE}/catalogs/hive_metastore_analytics/schemas/poc_demo/tables" \
+    "/api/metalakes/${METALAKE}/catalogs/AC-HMS/schemas/poc_demo/tables" \
     "${OC_JWT}" \
     '{"name":"forbidden_table","columns":[],"comment":"should not be created"}'
 fi
@@ -217,17 +191,17 @@ echo ""
 echo "── Test 3: ac_writer attempts WRITE to operational catalog ──────────────"
 echo "   Expected: 403 Forbidden — ac_writer has only READ access to OC catalog"
 
-echo -e "${INFO} Fetching JWT-SVID for spark-ac-writer..."
-AC_JWT=$(fetch_jwt "validate-ac-writer" "spark-ac-writer")
+echo -e "${INFO} Minting JWT-SVID for spark-ac-writer..."
+AC_JWT=$(mint_jwt "spiffe://gravitino.demo/spark-ac-writer")
 
 if [ -z "${AC_JWT}" ]; then
-  skip "Test 3: Could not fetch ac_writer JWT (SPIRE may not be ready) — skipping"
+  skip "Test 3: Could not mint ac_writer JWT (SPIRE may not be ready) — skipping"
 else
   echo -e "${INFO} JWT obtained for spiffe://gravitino.demo/spark-ac-writer"
 
   # Try to create a table in oc_iceberg — should be denied
   check_http \
-    "ac_writer CREATE TABLE in oc_iceberg" \
+    "ac_writer CREATE TABLE in oc_iceberg (write denied)" \
     "403" "POST" \
     "/api/metalakes/${METALAKE}/catalogs/oc_iceberg/schemas/poc_demo/tables" \
     "${AC_JWT}" \

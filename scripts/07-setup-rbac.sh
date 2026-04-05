@@ -51,7 +51,7 @@
 #       → An oc_writer can write to operational; can read analytical for comparison
 #
 #     ac_writer_role:
-#       • FULL access to ac catalog (hive_metastore_analytics)
+#       • FULL access to ac catalog (AC-HMS)
 #       • READ-ONLY access to oc_iceberg catalog (SELECT_TABLE, USE_CATALOG only)
 #       → An ac_writer can read operational (source), write to analytical (dest)
 #
@@ -133,38 +133,18 @@ GRAVITINO_URL="http://localhost:${LOCAL_PORT}"
 #               "exp": <5 min from now>,
 #               "iat": <now>}
 
-info "Fetching admin JWT-SVID from SPIRE..."
-kubectl delete pod spire-admin-jwt-fetch -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
-kubectl run spire-admin-jwt-fetch \
-  --image=ghcr.io/spiffe/spire-agent:1.9.6 \
-  --restart=Never \
-  -n "${NAMESPACE}" \
-  -l "spiffe-workload=gravitino-admin" \
-  --overrides="{
-    \"spec\": {
-      \"containers\": [{
-        \"name\": \"spire-admin-jwt-fetch\",
-        \"image\": \"ghcr.io/spiffe/spire-agent:1.9.6\",
-        \"command\": [\"/opt/spire/bin/spire-agent\", \"api\", \"fetch\", \"jwt\",
-                     \"-audience\", \"gravitino\",
-                     \"-socketPath\", \"/run/spire/sockets/agent.sock\"],
-        \"volumeMounts\": [{
-          \"name\": \"spire-socket\",
-          \"mountPath\": \"/run/spire/sockets\"
-        }]
-      }],
-      \"volumes\": [{
-        \"name\": \"spire-socket\",
-        \"hostPath\": {\"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}
-      }]
-    }
-  }" > /dev/null 2>&1
-# Wait for the pod to complete (max 30 seconds)
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/spire-admin-jwt-fetch \
-  -n "${NAMESPACE}" --timeout=30s > /dev/null 2>&1 || true
-ADMIN_JWT=$(kubectl logs spire-admin-jwt-fetch -n "${NAMESPACE}" 2>/dev/null | \
-  grep -oE 'eyJ[A-Za-z0-9._-]+' | head -1)
-kubectl delete pod spire-admin-jwt-fetch -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+info "Minting admin JWT-SVID directly from SPIRE Server..."
+# On Docker Desktop, the SPIRE Agent's k8s WorkloadAttestor cannot resolve
+# process PIDs to container IDs (cgroup path format mismatch with containerd).
+# Instead of using the workload API, we mint the JWT directly on the server:
+#   spire-server jwt mint -spiffeID ... -audience ... -socketPath ...
+# This is a privileged operation (admin) and is valid for RBAC bootstrap scripts.
+SPIRE_SERVER_POD=$(kubectl get pod -n "${NAMESPACE}" -l app=spire-server -o jsonpath='{.items[0].metadata.name}')
+ADMIN_JWT=$(kubectl exec -n "${NAMESPACE}" "${SPIRE_SERVER_POD}" -c spire-server -- \
+  /opt/spire/bin/spire-server jwt mint \
+  -spiffeID spiffe://gravitino.demo/admin \
+  -audience gravitino \
+  -socketPath /run/spire/sockets/server.sock 2>/dev/null | tr -d '\n') || ADMIN_JWT=""
 
 if [ -z "${ADMIN_JWT}" ]; then
   warn "Could not fetch admin JWT-SVID from SPIRE."
@@ -321,7 +301,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
     },
     {
       "type": "CATALOG",
-      "fullName": "hive_metastore_analytics",
+      "fullName": "AC-HMS",
       "privileges": [
         {"name": "USE_CATALOG",  "condition": "ALLOW"},
         {"name": "USE_SCHEMA",   "condition": "ALLOW"},
@@ -345,7 +325,7 @@ gravitino_post "/api/metalakes/${METALAKE}/roles" '{
   "securableObjects": [
     {
       "type": "CATALOG",
-      "fullName": "hive_metastore_analytics",
+      "fullName": "AC-HMS",
       "privileges": [
         {"name": "USE_CATALOG",   "condition": "ALLOW"},
         {"name": "USE_SCHEMA",    "condition": "ALLOW"},

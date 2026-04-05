@@ -56,7 +56,7 @@ SCRIPT_FILE="/tmp/gravitino-iceberg-spark-demo.py"
 WRAPPER_FILE="/tmp/gravitino-spark-oc-wrapper.sh"
 
 # Validate JARs
-for JAR in iceberg-spark-runtime-3.5_2.12-1.6.1.jar hadoop-aws-3.3.4.jar aws-java-sdk-bundle-1.12.262.jar; do
+for JAR in iceberg-spark-runtime-3.5_2.12-1.6.1.jar hadoop-aws-3.3.4.jar aws-sdk-java-bundle-2.26.20.jar; do
   if [ ! -f "${JAR_DIR}/${JAR}" ]; then
     echo "ERROR: Missing JAR: ${JAR_DIR}/${JAR}"
     echo "       Run:  bash scripts/00-download-jars.sh"
@@ -108,6 +108,13 @@ catalog = "oc_iceberg"
 db      = "poc_demo"
 table   = "sensor_readings"
 full    = f"`{catalog}`.{db}.{table}"
+
+# With dynamic-config-provider active (SPIRE/OAuth2 mode), Gravitino's Iceberg REST
+# proxies namespace operations through the management layer → propagates to HMS.
+# CREATE NAMESPACE IF NOT EXISTS is safe to run on every execution.
+print(f"\n=== [0/3] Ensuring namespace {catalog}.{db} ===")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS `{catalog}`.{db}")
+print(f"    Namespace ready.")
 
 print(f"\n=== [1/3] Creating Iceberg table {full} (if not exists) ===")
 spark.sql(f"""
@@ -172,15 +179,26 @@ cat > "${WRAPPER_FILE}" << WRAPEOF
 set -e
 
 JWT_FILE="/run/spire/jwt/token"
+JWT_SECRET_FILE="/run/spire/jwt-secret/token"
 JWT_TOKEN=""
 
-# ── Read JWT-SVID from shared volume ─────────────────────────────────────────
-if [ -f "\${JWT_FILE}" ] && [ -s "\${JWT_FILE}" ]; then
+# ── Read JWT-SVID: prefer pre-minted Secret, fallback to workload API ─────────
+# Priority:
+#   1. /run/spire/jwt-secret/token — pre-minted by the shell script from
+#      SPIRE Server directly (reliable on Docker Desktop)
+#   2. /run/spire/jwt/token — written by init container via workload API
+#      (works on Linux clusters with proper CNI; fails on Docker Desktop
+#      due to cgroup path mismatch in k8s WorkloadAttestor)
+if [ -f "\${JWT_SECRET_FILE}" ] && [ -s "\${JWT_SECRET_FILE}" ]; then
+    JWT_TOKEN=\$(cat "\${JWT_SECRET_FILE}")
+    echo "[SPIFFE] JWT-SVID loaded from pre-minted Secret (server-side mint)"
+    echo "[SPIFFE] First 60 chars of token: \$(echo \${JWT_TOKEN} | cut -c1-60)..."
+elif [ -f "\${JWT_FILE}" ] && [ -s "\${JWT_FILE}" ]; then
     JWT_TOKEN=\$(cat "\${JWT_FILE}")
-    echo "[SPIFFE] JWT-SVID loaded from \${JWT_FILE}"
+    echo "[SPIFFE] JWT-SVID loaded from workload API at \${JWT_FILE}"
     echo "[SPIFFE] First 60 chars of token: \$(echo \${JWT_TOKEN} | cut -c1-60)..."
 else
-    echo "[SPIFFE] WARNING: No JWT-SVID found at \${JWT_FILE}"
+    echo "[SPIFFE] WARNING: No JWT-SVID found at either source"
     echo "[SPIFFE] Running without authentication token."
     echo "[SPIFFE] If SPIRE is deployed, check init container logs:"
     echo "[SPIFFE]   kubectl logs ${POD_NAME} -n ${NAMESPACE} -c fetch-spire-jwt"
@@ -193,17 +211,31 @@ fi
 #
 # Gravitino then validates the JWT against SPIRE's OIDC JWKS endpoint and
 # enforces RBAC: spark-oc-writer has MODIFY_TABLE on oc_iceberg → ALLOWED.
+#
+# IMPORTANT: Only pass the token conf when the token is non-empty. Passing an
+# empty token triggers "Authorization: Bearer " which Gravitino rejects with 401.
+TOKEN_CONF=""
+if [ -n "\${JWT_TOKEN}" ]; then
+    TOKEN_CONF="--conf spark.sql.catalog.oc_iceberg.token=\${JWT_TOKEN}"
+    echo "[SPIFFE] Running Spark with SPIFFE Bearer token."
+else
+    echo "[SPIFFE] Running Spark without auth token (no SPIRE or token empty)."
+fi
+
 exec /opt/spark/bin/spark-submit \\
   --master local[*] \\
-  --jars /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-java-sdk-bundle-1.12.262.jar \\
-  --driver-class-path /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-java-sdk-bundle-1.12.262.jar \\
+  --jars /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-sdk-java-bundle-2.26.20.jar \\
+  --driver-class-path /jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-sdk-java-bundle-2.26.20.jar \\
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \\
   --conf spark.sql.catalog.oc_iceberg=org.apache.iceberg.spark.SparkCatalog \\
   --conf spark.sql.catalog.oc_iceberg.type=rest \\
   --conf spark.sql.catalog.oc_iceberg.uri=http://gravitino.gravitino.svc.cluster.local:9001/iceberg \\
-  --conf spark.sql.catalog.oc_iceberg.io-impl=org.apache.iceberg.hadoop.HadoopFileIO \\
-  --conf "spark.sql.catalog.oc_iceberg.token=\${JWT_TOKEN}" \\
+  \${TOKEN_CONF} \\
   --conf spark.sql.warehouse.dir=/tmp/spark-warehouse \\
+  --conf spark.sql.catalog.oc_iceberg.s3.access-key-id=admin \\
+  --conf spark.sql.catalog.oc_iceberg.s3.secret-access-key=admin \\
+  --conf spark.sql.catalog.oc_iceberg.s3.endpoint=http://seaweedfs-filer.gravitino.svc.cluster.local:8333 \\
+  --conf spark.sql.catalog.oc_iceberg.s3.path-style-access=true \\
   --conf spark.hadoop.fs.s3a.endpoint=http://seaweedfs-filer.gravitino.svc.cluster.local:8333 \\
   --conf spark.hadoop.fs.s3a.access.key=admin \\
   --conf spark.hadoop.fs.s3a.secret.key=admin \\
@@ -213,6 +245,33 @@ exec /opt/spark/bin/spark-submit \\
   --conf spark.hadoop.fs.s3a.fast.upload=true \\
   /script/spark-demo.py
 WRAPEOF
+
+# ── Pre-flight: clean stale HMS entries + ensure schema exists ────────────────
+# If S3 buckets were deleted and recreated between runs, HMS still holds table
+# entries pointing to non-existent S3 metadata. Iceberg's loadTable() will fail
+# even on CREATE TABLE IF NOT EXISTS or DROP TABLE because it reads S3 metadata
+# before doing anything. Bypass Iceberg entirely and purge the stale HMS entries
+# directly from MySQL so the next CREATE TABLE starts clean.
+# Then recreate the schema via Gravitino management API — CREATE NAMESPACE via
+# Iceberg REST does not propagate to HMS in Gravitino 1.2.0.
+echo "[0/4] Pre-flight: cleaning stale HMS table entries (keeping schema 'poc_demo')..."
+# Only delete stale table/partition entries — keep the poc_demo database.
+# With dynamic-config-provider active, Gravitino's Iceberg REST uses HMS for
+# namespace checks. If the database is deleted, Iceberg sees "namespace does
+# not exist". Deleting only table entries is enough to fix stale S3 metadata.
+kubectl exec -n "${NAMESPACE}" deployment/hive-metastore-mysql -- \
+  mysql -uroot -phiveroot hive_metastore -e "
+    SET FOREIGN_KEY_CHECKS=0;
+    DELETE FROM TABLE_PARAMS WHERE TBL_ID IN (
+      SELECT TBL_ID FROM TBLS WHERE DB_ID IN (
+        SELECT DB_ID FROM DBS WHERE NAME='poc_demo'));
+    DELETE FROM TBLS WHERE DB_ID IN (SELECT DB_ID FROM DBS WHERE NAME='poc_demo');
+    SET FOREIGN_KEY_CHECKS=1;
+  " 2>/dev/null || true
+
+# Schema creation is handled by the Spark job via CREATE NAMESPACE IF NOT EXISTS.
+# With dynamic-config-provider, Iceberg REST propagates namespace operations to HMS.
+echo "    (Schema poc_demo will be created by Spark if it doesn't exist)"
 
 # ── Deploy and run ────────────────────────────────────────────────────────────
 echo "[1/4] Updating ConfigMap '${CONFIGMAP_NAME}'..."
@@ -226,6 +285,45 @@ echo "[2/4] Cleaning up previous pod..."
 kubectl delete pod "${POD_NAME}" -n "${NAMESPACE}" --ignore-not-found
 
 echo "[3/4] Submitting Spark job with SPIFFE identity: spark-oc-writer..."
+
+# ── Pre-mint JWT via SPIRE Server (Docker Desktop workaround) ─────────────────
+# On Docker Desktop, the SPIRE Agent's k8s WorkloadAttestor cannot map PIDs to
+# containers (cgroup path format mismatch with containerd). The init container
+# writes an empty token file, and the Spark job would run unauthenticated.
+#
+# To demonstrate SPIFFE authentication on Docker Desktop, we pre-mint the JWT
+# from the SPIRE Server directly and inject it via a Kubernetes Secret. The init
+# container approach is kept for documentation purposes; in production on a
+# Linux cluster with a proper CNI, the init container would get the JWT from
+# the SPIRE Agent workload API without this fallback.
+#
+# The Secret is deleted after the Spark pod completes (short-lived JWT: 5 min).
+SPIRE_SERVER_POD=$(kubectl get pod -n "${NAMESPACE}" -l app=spire-server \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+PRE_MINTED_JWT=""
+if [ -n "${SPIRE_SERVER_POD}" ]; then
+  PRE_MINTED_JWT=$(kubectl exec -n "${NAMESPACE}" "${SPIRE_SERVER_POD}" -c spire-server -- \
+    /opt/spire/bin/spire-server jwt mint \
+    -spiffeID spiffe://gravitino.demo/spark-oc-writer \
+    -audience gravitino \
+    -socketPath /run/spire/sockets/server.sock 2>/dev/null | tr -d '\n') || PRE_MINTED_JWT=""
+fi
+
+# Inject JWT via Secret so the Spark pod can read it even if workload API fails.
+kubectl delete secret oc-writer-jwt -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
+if [ -n "${PRE_MINTED_JWT}" ]; then
+  kubectl create secret generic oc-writer-jwt \
+    --from-literal=token="${PRE_MINTED_JWT}" \
+    -n "${NAMESPACE}" > /dev/null 2>&1
+  echo "    [SPIFFE] Pre-minted JWT injected via Secret (Docker Desktop workaround)"
+  echo "    [SPIFFE] Identity: spiffe://gravitino.demo/spark-oc-writer"
+else
+  # Empty Secret — Spark will run without auth (SPIRE not available)
+  kubectl create secret generic oc-writer-jwt \
+    --from-literal=token="" \
+    -n "${NAMESPACE}" > /dev/null 2>&1
+  echo "    [SPIFFE] No SPIRE Server found — Spark will run without auth token"
+fi
 
 # ── Pod label: spiffe-workload=spark-oc-writer ────────────────────────────────
 # This label is the trigger for SPIRE workload attestation. When the init
@@ -265,7 +363,9 @@ kubectl run "${POD_NAME}" \
           {\"name\": \"jars\",        \"mountPath\": \"/jars\"},
           {\"name\": \"script\",      \"mountPath\": \"/script\"},
           {\"name\": \"spire-socket\",\"mountPath\": \"/run/spire/sockets\"},
-          {\"name\": \"jwt-dir\",     \"mountPath\": \"/run/spire/jwt\"}
+          {\"name\": \"jwt-dir\",     \"mountPath\": \"/run/spire/jwt\"},
+          {\"name\": \"jwt-secret\",  \"mountPath\": \"/run/spire/jwt-secret\",
+           \"readOnly\": true}
         ]
       }],
       \"volumes\": [
@@ -274,7 +374,8 @@ kubectl run "${POD_NAME}" \
           \"defaultMode\": 493}},
         {\"name\": \"spire-socket\", \"hostPath\": {
           \"path\": \"/run/spire/sockets\", \"type\": \"DirectoryOrCreate\"}},
-        {\"name\": \"jwt-dir\", \"emptyDir\": {}}
+        {\"name\": \"jwt-dir\", \"emptyDir\": {}},
+        {\"name\": \"jwt-secret\", \"secret\": {\"secretName\": \"oc-writer-jwt\"}}
       ]
     }
   }"
@@ -294,6 +395,8 @@ while true; do
       sleep 5; ELAPSED=$(( ELAPSED + 5 )) ;;
   esac
 done
+
+kubectl delete secret oc-writer-jwt -n "${NAMESPACE}" --ignore-not-found > /dev/null 2>&1
 
 echo ""
 echo "════════════════════════════════════════════════════════════"
