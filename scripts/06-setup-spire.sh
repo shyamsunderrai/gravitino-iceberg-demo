@@ -124,6 +124,28 @@ echo "════════════════════════�
 echo " Phase 2: Deploying SPIRE Agent"
 echo "════════════════════════════════════════════════════════════════════════════"
 
+# Clear stale agent data from node hostPath before deploying.
+# If the SPIRE Server was previously deleted and recreated, its CA changed.
+# The agent will have a cached bundle from the old server that can't verify
+# the new server's certificate → "x509: certificate signed by unknown authority".
+# Wiping the data dir forces a clean insecure_bootstrap on first connect.
+info "Clearing stale SPIRE Agent data from node hostPath (safe to run even if empty)..."
+kubectl run spire-agent-cleanup --restart=Never --rm \
+  --image=busybox:1.36 -n "${NAMESPACE}" \
+  --overrides="{
+    \"spec\": {
+      \"nodeSelector\": {\"kubernetes.io/hostname\": \"docker-desktop\"},
+      \"containers\": [{
+        \"name\": \"spire-agent-cleanup\",
+        \"image\": \"busybox:1.36\",
+        \"command\": [\"sh\",\"-c\",\"rm -rf /run/spire/agent-data/* && echo CLEANED\"],
+        \"securityContext\": {\"privileged\": true},
+        \"volumeMounts\": [{\"name\":\"agent-data\",\"mountPath\":\"/run/spire/agent-data\"}]
+      }],
+      \"volumes\": [{\"name\":\"agent-data\",\"hostPath\":{\"path\":\"/run/spire/agent-data\"}}]
+    }
+  }" 2>/dev/null && success "Agent data cleared" || warn "Cleanup pod skipped (may already be clean)"
+
 kubectl apply -f "${DEPLOY_DIR}/07-spire-agent.yaml"
 
 info "Waiting for SPIRE Agent DaemonSet to be ready..."

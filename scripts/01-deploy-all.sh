@@ -43,6 +43,12 @@ wait_helm() {
     --for=condition=Ready --timeout=300s
 }
 
+# ── Step 0: Helm repositories ─────────────────────────────────────────────────
+echo "[0/6] Ensuring Helm repositories..."
+helm repo add bitnami https://charts.bitnami.com/bitnami 2>/dev/null || true
+helm repo update bitnami
+echo "  Helm repositories ready."
+
 # ── Step 1: Namespace ─────────────────────────────────────────────────────────
 echo "[1/6] Creating namespace '${NAMESPACE}'..."
 kubectl apply -f "${DEPLOY_DIR}/00-namespace.yaml"
@@ -54,14 +60,21 @@ wait_deploy seaweedfs-master
 wait_deploy seaweedfs-volume
 wait_deploy seaweedfs-filer
 
-echo "  SeaweedFS is up. Waiting 5s for S3 API to initialise..."
-sleep 5
-
 # ── Step 3: Create S3 buckets ─────────────────────────────────────────────────
 echo "[3/6] Creating S3 buckets via NodePort 30334..."
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
+
+echo "  Waiting for SeaweedFS S3 API to be ready..."
+for i in $(seq 1 30); do
+  if aws --endpoint-url http://localhost:30334 s3 ls &>/dev/null; then
+    echo "  SeaweedFS S3 API is ready."
+    break
+  fi
+  echo "  Not ready yet (attempt ${i}/30), retrying in 5s..."
+  sleep 5
+done
 
 for BUCKET in operational analytical; do
   if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
@@ -80,11 +93,13 @@ if helm status gravitino -n "${NAMESPACE}" &>/dev/null; then
   echo "  Helm release 'gravitino' exists — upgrading..."
   helm upgrade gravitino "${CHARTS_DIR}/gravitino" \
     -n "${NAMESPACE}" \
-    -f "${DEPLOY_DIR}/03-gravitino-values.yaml"
+    -f "${DEPLOY_DIR}/03-gravitino-values.yaml" \
+    --dependency-update
 else
   helm install gravitino "${CHARTS_DIR}/gravitino" \
     -n "${NAMESPACE}" \
-    -f "${DEPLOY_DIR}/03-gravitino-values.yaml"
+    -f "${DEPLOY_DIR}/03-gravitino-values.yaml" \
+    --dependency-update
 fi
 wait_deploy gravitino
 

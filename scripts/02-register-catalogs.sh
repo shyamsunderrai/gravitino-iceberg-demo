@@ -23,6 +23,8 @@ LOCAL_PORT=18090
 METALAKE="poc_layer"
 
 echo "[1/5] Starting port-forward to Gravitino service on localhost:${LOCAL_PORT}..."
+pkill -f "port-forward.*gravitino" 2>/dev/null || true
+sleep 1
 kubectl port-forward -n "${NAMESPACE}" svc/gravitino \
   "${LOCAL_PORT}:${GRAVITINO_PORT}" &
 PF_PID=$!
@@ -63,7 +65,11 @@ gravitino_post "/api/metalakes/${METALAKE}/catalogs" \
   "Catalog 'OC-HMS'"
 
 # ── Step 4: oc_iceberg ────────────────────────────────────────────────────────
+# Force-delete if it exists with stale properties (e.g. io-impl left over from
+# a previous SPIRE debug session) then recreate clean. A 404 on delete is fine.
 echo "[4/5] Registering catalog 'oc_iceberg'..."
+curl -s -o /dev/null -X DELETE \
+  "http://localhost:${LOCAL_PORT}/api/metalakes/${METALAKE}/catalogs/oc_iceberg?force=true" || true
 gravitino_post "/api/metalakes/${METALAKE}/catalogs" \
   '{"name":"oc_iceberg","type":"RELATIONAL","provider":"lakehouse-iceberg","comment":"Iceberg catalog on OC-HMS + SeaweedFS operational bucket","properties":{"catalog-backend":"hive","uri":"thrift://hive-metastore.gravitino.svc.cluster.local:9083","warehouse":"s3a://operational/iceberg-warehouse"}}' \
   "Catalog 'oc_iceberg'"
@@ -77,6 +83,10 @@ gravitino_post "/api/metalakes/${METALAKE}/catalogs" \
 echo ""
 echo "✓  Setup complete: metalake '${METALAKE}' with catalogs OC-HMS, oc_iceberg, AC-HMS."
 echo ""
-echo "   Validate in Gravitino UI:"
-echo "     kubectl port-forward -n gravitino svc/gravitino 8090:8090"
-echo "     open http://localhost:8090"
+echo "   Starting Gravitino UI port-forward in background..."
+pkill -f "port-forward.*gravitino" 2>/dev/null || true
+sleep 1
+kubectl port-forward -n "${NAMESPACE}" svc/gravitino 8090:8090 > /dev/null 2>&1 &
+echo "   Gravitino UI: http://localhost:8090  (port-forward PID: $!)"
+echo "   Opening browser..."
+open http://localhost:8090

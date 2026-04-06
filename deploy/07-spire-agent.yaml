@@ -182,6 +182,14 @@ data:
           # configure proper kubelet CA verification, but for a local demo
           # this avoids certificate setup complexity.
           skip_kubelet_verification = true
+          # Docker Desktop runs containerd inside a Linux VM. The cgroup
+          # paths that /proc/<pid>/cgroup reports do not match the container
+          # IDs in Kubernetes pod specs, so both the legacy and new container
+          # locators fail with "Container id not found".
+          # Disabling container selectors makes the WorkloadAttestor match
+          # only on pod-level selectors (namespace, pod labels, SA) — which
+          # is all we need for this demo.
+          disable_container_selectors = true
         }
       }
 

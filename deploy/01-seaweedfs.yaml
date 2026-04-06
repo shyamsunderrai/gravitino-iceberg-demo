@@ -126,6 +126,8 @@ metadata:
   namespace: gravitino
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: seaweedfs-filer
@@ -138,7 +140,13 @@ spec:
         - name: filer
           image: chrislusf/seaweedfs:dev
           imagePullPolicy: IfNotPresent
-          args: [filer, -master=seaweedfs-master:9333, -port=8888, -s3, -s3.port=8333]
+          args:
+            - filer
+            - -master=seaweedfs-master:9333
+            - -port=8888
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
           ports:
             - name: http
               containerPort: 8888
@@ -149,10 +157,45 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: seaweedfs-filer-pvc
+        - name: s3-config
+          configMap:
+            name: seaweedfs-s3-config
+---
+# ConfigMap: SeaweedFS S3 IAM credentials
+# Defines the admin access key pair used by all demo components.
+# Without this, SeaweedFS rejects authenticated S3 requests with InvalidAccessKeyId.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seaweedfs-s3-config
+  namespace: gravitino
+data:
+  s3.json: |
+    {
+      "identities": [
+        {
+          "name": "admin",
+          "credentials": [
+            {
+              "accessKey": "admin",
+              "secretKey": "admin"
+            }
+          ],
+          "actions": [
+            "Admin",
+            "Read",
+            "Write"
+          ]
+        }
+      ]
+    }
 ---
 # Service: Master (cluster-internal)
 apiVersion: v1
