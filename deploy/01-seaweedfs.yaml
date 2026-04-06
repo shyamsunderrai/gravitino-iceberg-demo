@@ -140,7 +140,13 @@ spec:
         - name: filer
           image: chrislusf/seaweedfs:dev
           imagePullPolicy: IfNotPresent
-          args: [filer, -master=seaweedfs-master:9333, -port=8888, -s3, -s3.port=8333]
+          args:
+            - filer
+            - -master=seaweedfs-master:9333
+            - -port=8888
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
           ports:
             - name: http
               containerPort: 8888
@@ -151,10 +157,38 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: seaweedfs-filer-pvc
+        - name: s3-config
+          configMap:
+            name: seaweedfs-s3-config
+---
+# ConfigMap: SeaweedFS S3 credentials
+# The seaweedfs:dev image always enforces IAM ("standard IAM" mode) regardless
+# of whether -s3.config is set. Without a config file, the S3 gateway starts
+# with 0 keys and rejects everything. With -s3.config pointing to this file,
+# credentials are loaded synchronously before the S3 port opens — no race.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seaweedfs-s3-config
+  namespace: gravitino
+data:
+  s3.json: |
+    {
+      "identities": [
+        {
+          "name": "admin",
+          "credentials": [{"accessKey": "admin", "secretKey": "admin"}],
+          "actions": ["Admin", "Read", "Write"]
+        }
+      ]
+    }
 ---
 # Service: Master (cluster-internal)
 apiVersion: v1
