@@ -66,34 +66,30 @@ export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
 
-# Wait until SeaweedFS accepts authenticated requests.
-# s3 ls (ListBuckets) is allowed anonymously by SeaweedFS even before the
-# s3.json IAM config is loaded, so it always returns 0 and cannot be used
-# as a readiness signal for auth. Instead, test CreateBucket — an operation
-# that requires a valid access key — and retry until it succeeds.
-echo "  Waiting for SeaweedFS to accept authenticated S3 requests..."
-for i in $(seq 1 30); do
-  ERR=$(aws --endpoint-url http://localhost:30334 s3 mb s3://probe-auth 2>&1 || true)
-  if echo "${ERR}" | grep -q "InvalidAccessKeyId"; then
-    echo "  S3 API up but IAM not loaded yet (attempt ${i}/30), retrying in 5s..."
-    sleep 5
-  elif echo "${ERR}" | grep -qE "BucketAlreadyExists|make_bucket|Created"; then
-    aws --endpoint-url http://localhost:30334 s3 rb s3://probe-auth &>/dev/null || true
-    echo "  SeaweedFS S3 API ready (authenticated write accepted)."
-    break
-  else
-    echo "  S3 API not yet reachable (attempt ${i}/30), retrying in 5s..."
-    sleep 5
-  fi
-done
-
+# Create buckets with retry on InvalidAccessKeyId.
+# SeaweedFS loads its s3.json IAM config asynchronously after the filer starts.
+# ListBuckets (s3 ls) is allowed anonymously so it cannot probe IAM readiness.
+# Instead, retry the actual bucket creation — if IAM is not loaded yet we get
+# InvalidAccessKeyId; once the config is loaded the operation succeeds.
 for BUCKET in operational analytical; do
-  if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
-    echo "  Bucket '${BUCKET}' already exists — skipping."
-  else
-    aws --endpoint-url http://localhost:30334 s3 mb "s3://${BUCKET}"
-    echo "  Created bucket '${BUCKET}'."
-  fi
+  echo "  Ensuring bucket '${BUCKET}'..."
+  for attempt in $(seq 1 24); do
+    if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
+      echo "  Bucket '${BUCKET}' already exists — skipping."
+      break
+    fi
+    ERR=$(aws --endpoint-url http://localhost:30334 s3 mb "s3://${BUCKET}" 2>&1) && {
+      echo "  Created bucket '${BUCKET}'."
+      break
+    } || true
+    if echo "${ERR}" | grep -q "InvalidAccessKeyId"; then
+      echo "  SeaweedFS IAM not ready yet (attempt ${attempt}/24), retrying in 5s..."
+      sleep 5
+    else
+      echo "ERROR: unexpected error creating bucket '${BUCKET}': ${ERR}" >&2
+      exit 1
+    fi
+  done
 done
 
 # ── Step 4: Gravitino ─────────────────────────────────────────────────────────
