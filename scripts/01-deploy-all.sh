@@ -66,14 +66,25 @@ export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
 
-echo "  Waiting for SeaweedFS S3 API to be ready..."
+# Wait until SeaweedFS accepts authenticated requests.
+# s3 ls (ListBuckets) is allowed anonymously by SeaweedFS even before the
+# s3.json IAM config is loaded, so it always returns 0 and cannot be used
+# as a readiness signal for auth. Instead, test CreateBucket — an operation
+# that requires a valid access key — and retry until it succeeds.
+echo "  Waiting for SeaweedFS to accept authenticated S3 requests..."
 for i in $(seq 1 30); do
-  if aws --endpoint-url http://localhost:30334 s3 ls &>/dev/null; then
-    echo "  SeaweedFS S3 API is ready."
+  ERR=$(aws --endpoint-url http://localhost:30334 s3 mb s3://probe-auth 2>&1 || true)
+  if echo "${ERR}" | grep -q "InvalidAccessKeyId"; then
+    echo "  S3 API up but IAM not loaded yet (attempt ${i}/30), retrying in 5s..."
+    sleep 5
+  elif echo "${ERR}" | grep -qE "BucketAlreadyExists|make_bucket|Created"; then
+    aws --endpoint-url http://localhost:30334 s3 rb s3://probe-auth &>/dev/null || true
+    echo "  SeaweedFS S3 API ready (authenticated write accepted)."
     break
+  else
+    echo "  S3 API not yet reachable (attempt ${i}/30), retrying in 5s..."
+    sleep 5
   fi
-  echo "  Not ready yet (attempt ${i}/30), retrying in 5s..."
-  sleep 5
 done
 
 for BUCKET in operational analytical; do
