@@ -66,30 +66,22 @@ export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
 
-# Create buckets with retry on InvalidAccessKeyId.
-# SeaweedFS loads its s3.json IAM config asynchronously after the filer starts.
-# ListBuckets (s3 ls) is allowed anonymously so it cannot probe IAM readiness.
-# Instead, retry the actual bucket creation — if IAM is not loaded yet we get
-# InvalidAccessKeyId; once the config is loaded the operation succeeds.
+# SeaweedFS runs without S3 IAM validation — any credentials are accepted.
+# Just wait until the S3 API is reachable, then create the buckets.
+echo "  Waiting for SeaweedFS S3 API to be ready..."
+for i in $(seq 1 30); do
+  aws --endpoint-url http://localhost:30334 s3 ls &>/dev/null && break
+  echo "  Not ready yet (attempt ${i}/30), retrying in 5s..."
+  sleep 5
+done
+
 for BUCKET in operational analytical; do
-  echo "  Ensuring bucket '${BUCKET}'..."
-  for attempt in $(seq 1 24); do
-    if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
-      echo "  Bucket '${BUCKET}' already exists — skipping."
-      break
-    fi
-    ERR=$(aws --endpoint-url http://localhost:30334 s3 mb "s3://${BUCKET}" 2>&1) && {
-      echo "  Created bucket '${BUCKET}'."
-      break
-    } || true
-    if echo "${ERR}" | grep -q "InvalidAccessKeyId"; then
-      echo "  SeaweedFS IAM not ready yet (attempt ${attempt}/24), retrying in 5s..."
-      sleep 5
-    else
-      echo "ERROR: unexpected error creating bucket '${BUCKET}': ${ERR}" >&2
-      exit 1
-    fi
-  done
+  if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
+    echo "  Bucket '${BUCKET}' already exists — skipping."
+  else
+    aws --endpoint-url http://localhost:30334 s3 mb "s3://${BUCKET}"
+    echo "  Created bucket '${BUCKET}'."
+  fi
 done
 
 # ── Step 4: Gravitino ─────────────────────────────────────────────────────────
