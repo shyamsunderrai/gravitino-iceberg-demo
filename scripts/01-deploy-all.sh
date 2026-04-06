@@ -55,6 +55,14 @@ kubectl apply -f "${DEPLOY_DIR}/00-namespace.yaml"
 
 # ── Step 2: SeaweedFS ─────────────────────────────────────────────────────────
 echo "[2/6] Deploying SeaweedFS..."
+# Scale filer to 0 before applying to release the LevelDB lock.
+# Without this, re-runs leave the old filer pod running while the new one starts,
+# causing "resource temporarily unavailable" on /data/filerldb2/.
+if kubectl get deployment/seaweedfs-filer -n "${NAMESPACE}" &>/dev/null; then
+  echo "  Scaling seaweedfs-filer to 0 to release LevelDB lock..."
+  kubectl scale deployment/seaweedfs-filer -n "${NAMESPACE}" --replicas=0
+  kubectl wait --for=delete pod -l app=seaweedfs-filer -n "${NAMESPACE}" --timeout=60s 2>/dev/null || true
+fi
 kubectl apply -f "${DEPLOY_DIR}/01-seaweedfs.yaml"
 wait_deploy seaweedfs-master
 wait_deploy seaweedfs-volume
