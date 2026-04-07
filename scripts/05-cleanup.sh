@@ -7,9 +7,11 @@
 #      (clears HMS metadata for both OC-HMS and AC-HMS)
 #   2. Wiping all objects from the operational and analytical S3 buckets
 #      (removes all Parquet data files and Iceberg metadata files)
+#   3. Deleting all SeaweedFS PVCs so the next deploy starts with clean
+#      LevelDB state and fresh S3 credentials from the ConfigMap.
 #
 # Gravitino catalog registrations (metalake + catalogs) are preserved.
-# Run 03-iceberg-write-demo.sh again after this to start fresh.
+# Run 01-deploy-all.sh then 03-iceberg-write-demo.sh to start fresh.
 #
 # Prerequisites:
 #   - kubectl configured and pointing to the right cluster
@@ -69,8 +71,8 @@ kubectl run "${POD_NAME}" \
         \"command\": [
           \"/opt/spark/bin/spark-submit\",
           \"--master\", \"local[*]\",
-          \"--jars\", \"/jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-java-sdk-bundle-1.12.262.jar\",
-          \"--driver-class-path\", \"/jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-java-sdk-bundle-1.12.262.jar\",
+          \"--jars\", \"/jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,/jars/hadoop-aws-3.3.4.jar,/jars/aws-sdk-java-bundle-2.26.20.jar\",
+          \"--driver-class-path\", \"/jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar:/jars/hadoop-aws-3.3.4.jar:/jars/aws-sdk-java-bundle-2.26.20.jar\",
           \"--conf\", \"spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions\",
           \"--conf\", \"spark.sql.warehouse.dir=/tmp/spark-warehouse\",
           \"--conf\", \"spark.sql.catalog.oc_iceberg=org.apache.iceberg.spark.SparkCatalog\",
@@ -134,6 +136,19 @@ for BUCKET in operational analytical; do
   fi
 done
 
+# ── Step 3: Delete SeaweedFS PVCs ────────────────────────────────────────────
 echo ""
-echo "[3/3] Done."
-echo "✓  Cleanup complete. Run scripts/03-iceberg-write-demo.sh to start fresh."
+echo "[3/4] Deleting SeaweedFS PVCs..."
+# Scale filer to 0 first to release the LevelDB lock before deleting its PVC.
+if kubectl get deployment/seaweedfs-filer -n "${NAMESPACE}" &>/dev/null; then
+  kubectl scale deployment/seaweedfs-filer -n "${NAMESPACE}" --replicas=0
+  kubectl wait --for=delete pod -l app=seaweedfs-filer -n "${NAMESPACE}" --timeout=60s 2>/dev/null || true
+fi
+for PVC in seaweedfs-filer-pvc seaweedfs-master-pvc seaweedfs-volume-pvc; do
+  kubectl delete pvc "${PVC}" -n "${NAMESPACE}" --ignore-not-found \
+    && echo "  Deleted ${PVC}." || true
+done
+
+echo ""
+echo "[4/4] Done."
+echo "✓  Cleanup complete. Run scripts/01-deploy-all.sh to redeploy from scratch."
