@@ -62,6 +62,12 @@ if kubectl get deployment/seaweedfs-filer -n "${NAMESPACE}" &>/dev/null; then
   echo "  Scaling seaweedfs-filer to 0 to release LevelDB lock..."
   kubectl scale deployment/seaweedfs-filer -n "${NAMESPACE}" --replicas=0
   kubectl wait --for=delete pod -l app=seaweedfs-filer -n "${NAMESPACE}" --timeout=60s 2>/dev/null || true
+  # Delete the filer PVC so LevelDB starts clean. SeaweedFS writes IAM
+  # credentials from -s3.config into LevelDB on first start. If stale
+  # LevelDB data exists (e.g. from a pre-fix deployment with no credentials),
+  # SeaweedFS reads from the store and ignores -s3.config entirely.
+  echo "  Deleting seaweedfs-filer PVC to ensure clean LevelDB state..."
+  kubectl delete pvc seaweedfs-filer-pvc -n "${NAMESPACE}" --ignore-not-found
 fi
 kubectl apply -f "${DEPLOY_DIR}/01-seaweedfs.yaml"
 wait_deploy seaweedfs-master
