@@ -69,12 +69,22 @@ wait_deploy seaweedfs-volume
 wait_deploy seaweedfs-filer
 
 # ── Step 3: Create S3 buckets ─────────────────────────────────────────────────
-# SeaweedFS reads -s3.config synchronously at startup before the S3 port opens,
-# so credentials are ready as soon as the filer deployment is rolled out.
 echo "[3/6] Creating S3 buckets via NodePort 30334..."
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
+
+# The readiness probe confirms port 8333 is open, but SeaweedFS may still be
+# loading IAM credentials from -s3.config. Wait until ListBuckets succeeds.
+echo "  Waiting for SeaweedFS S3 credentials to be ready..."
+for i in $(seq 1 30); do
+  if aws --endpoint-url http://localhost:30334 s3 ls &>/dev/null 2>&1; then
+    echo "  SeaweedFS S3 ready."
+    break
+  fi
+  [ "${i}" -eq 30 ] && { echo "ERROR: SeaweedFS S3 did not become ready after 60s."; exit 1; }
+  sleep 2
+done
 
 for BUCKET in operational analytical; do
   if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
