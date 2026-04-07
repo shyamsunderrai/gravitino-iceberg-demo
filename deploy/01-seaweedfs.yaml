@@ -154,6 +154,12 @@ spec:
               containerPort: 18888
             - name: s3
               containerPort: 8333
+          readinessProbe:
+            tcpSocket:
+              port: 8333
+            initialDelaySeconds: 5
+            periodSeconds: 3
+            failureThreshold: 10
           volumeMounts:
             - name: data
               mountPath: /data
