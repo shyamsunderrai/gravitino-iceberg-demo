@@ -49,25 +49,89 @@ kubectl apply -f "${DEPLOY_DIR}/00-namespace.yaml"
 
 # ── Step 2: SeaweedFS ─────────────────────────────────────────────────────────
 echo "[2/6] Deploying SeaweedFS..."
+# Scale filer to 0 before applying to release the LevelDB lock on re-runs.
+if kubectl get deployment/seaweedfs-filer -n "${NAMESPACE}" &>/dev/null; then
+  echo "  Scaling seaweedfs-filer to 0 to release LevelDB lock..."
+  kubectl scale deployment/seaweedfs-filer -n "${NAMESPACE}" --replicas=0
+  kubectl wait --for=delete pod -l app=seaweedfs-filer -n "${NAMESPACE}" --timeout=60s 2>/dev/null || true
+fi
 kubectl apply -f "${DEPLOY_DIR}/01-seaweedfs.yaml"
 wait_deploy seaweedfs-master
 wait_deploy seaweedfs-volume
 wait_deploy seaweedfs-filer
 
-echo "  SeaweedFS is up. Waiting 5s for S3 API to initialise..."
-sleep 5
+# ── SeaweedFS S3 health check ─────────────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " SeaweedFS S3 health check"
+echo "════════════════════════════════════════════════════════════"
 
-# ── Step 3: Create S3 buckets ─────────────────────────────────────────────────
-echo "[3/6] Creating S3 buckets via NodePort 30334..."
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
+S3_ENDPOINT="http://localhost:30334"
 
+echo ""
+echo "[CHECK 1/4] Verifying s3.json is mounted inside the filer pod..."
+S3_JSON=$(kubectl exec -n "${NAMESPACE}" deployment/seaweedfs-filer -- \
+  cat /etc/seaweedfs/s3.json 2>&1) || true
+if echo "${S3_JSON}" | grep -q "accessKey"; then
+  echo "  Result: PASS"
+else
+  echo "  Result: FAIL — /etc/seaweedfs/s3.json is missing or has no credentials."
+  echo "  Output: ${S3_JSON}"
+  exit 1
+fi
+
+echo ""
+echo "[CHECK 2/4] Listing buckets (verifies S3 authentication)..."
+ATTEMPT=0
+while true; do
+  ATTEMPT=$(( ATTEMPT + 1 ))
+  echo "  Attempt ${ATTEMPT}/20: aws s3 ls ..."
+  LIST_OUT=$(aws --endpoint-url "${S3_ENDPOINT}" s3 ls 2>&1)
+  LIST_RC=$?
+  echo "  Output: ${LIST_OUT:-<empty — no buckets yet>}"
+  if [ ${LIST_RC} -eq 0 ]; then
+    echo "  Result: PASS"
+    break
+  fi
+  [ "${ATTEMPT}" -ge 20 ] && {
+    echo "  Result: FAIL — S3 auth did not succeed after $(( ATTEMPT * 3 ))s."
+    echo "  Run: kubectl logs -n ${NAMESPACE} deployment/seaweedfs-filer | tail -30"
+    exit 1
+  }
+  sleep 3
+done
+
+echo ""
+echo "[CHECK 3/4] Creating test bucket and listing it..."
+aws --endpoint-url "${S3_ENDPOINT}" s3 mb s3://s3-health-check
+aws --endpoint-url "${S3_ENDPOINT}" s3 ls s3://s3-health-check
+echo "  Result: PASS"
+
+echo ""
+echo "[CHECK 4/4] Writing, reading, and deleting a test object..."
+echo "health-ok" | aws --endpoint-url "${S3_ENDPOINT}" s3 cp - s3://s3-health-check/probe
+READ_OUT=$(aws --endpoint-url "${S3_ENDPOINT}" s3 cp s3://s3-health-check/probe - 2>&1)
+echo "  Read back: ${READ_OUT}"
+aws --endpoint-url "${S3_ENDPOINT}" s3 rm s3://s3-health-check/probe
+aws --endpoint-url "${S3_ENDPOINT}" s3 rb s3://s3-health-check
+echo "  Result: PASS"
+
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " SeaweedFS S3 is healthy — proceeding with deployment."
+echo "════════════════════════════════════════════════════════════"
+echo ""
+
+# ── Step 3: Create S3 buckets ─────────────────────────────────────────────────
+echo "[3/6] Creating S3 buckets..."
 for BUCKET in operational analytical; do
-  if aws --endpoint-url http://localhost:30334 s3 ls "s3://${BUCKET}" &>/dev/null; then
+  if aws --endpoint-url "${S3_ENDPOINT}" s3 ls "s3://${BUCKET}" &>/dev/null; then
     echo "  Bucket '${BUCKET}' already exists — skipping."
   else
-    aws --endpoint-url http://localhost:30334 s3 mb "s3://${BUCKET}"
+    aws --endpoint-url "${S3_ENDPOINT}" s3 mb "s3://${BUCKET}"
     echo "  Created bucket '${BUCKET}'."
   fi
 done
