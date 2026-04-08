@@ -157,6 +157,16 @@ for PVC in seaweedfs-filer-pvc seaweedfs-master-pvc seaweedfs-volume-pvc; do
     && echo "  Deleted ${PVC}." || true
 done
 
+# ── Step 4: Delete namespace ──────────────────────────────────────────────────
 echo ""
-echo "[4/4] Done."
-echo "✓  Cleanup complete. Run scripts/01-deploy-all.sh to redeploy from scratch."
+echo "[4/4] Deleting namespace '${NAMESPACE}'..."
+kubectl delete namespace "${NAMESPACE}" --ignore-not-found
+echo "  Waiting for namespace to be fully removed..."
+kubectl wait --for=delete namespace/"${NAMESPACE}" --timeout=120s 2>/dev/null || true
+echo "  Namespace '${NAMESPACE}' removed."
+
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " Cleanup complete."
+echo " Run scripts/01-deploy-all.sh to redeploy from scratch."
+echo "════════════════════════════════════════════════════════════"
