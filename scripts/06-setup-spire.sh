@@ -128,13 +128,20 @@ echo "════════════════════════�
 # If the SPIRE Server was previously deleted and recreated, its CA changed.
 # The agent will have a cached bundle from the old server that can't verify
 # the new server's certificate → "x509: certificate signed by unknown authority".
-# Wiping the data dir forces a clean insecure_bootstrap on first connect.
-info "Clearing stale SPIRE Agent data from node hostPath (safe to run even if empty)..."
-kubectl run spire-agent-cleanup --restart=Never --rm \
+# We must: (1) delete any existing agent pods first so they release the data dir,
+# then (2) wipe the dir, then (3) deploy the agent fresh.
+info "Deleting any existing SPIRE Agent pods before clearing data..."
+kubectl delete pods -n "${NAMESPACE}" -l app=spire-agent --ignore-not-found
+kubectl wait --for=delete pod -n "${NAMESPACE}" -l app=spire-agent --timeout=60s 2>/dev/null || true
+
+info "Clearing stale SPIRE Agent data from node hostPath..."
+NODE_NAME=$(kubectl get node -o jsonpath='{.items[0].metadata.name}')
+kubectl delete pod spire-agent-cleanup -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl run spire-agent-cleanup --restart=Never \
   --image=busybox:1.36 -n "${NAMESPACE}" \
   --overrides="{
     \"spec\": {
-      \"nodeSelector\": {\"kubernetes.io/hostname\": \"docker-desktop\"},
+      \"nodeSelector\": {\"kubernetes.io/hostname\": \"${NODE_NAME}\"},
       \"containers\": [{
         \"name\": \"spire-agent-cleanup\",
         \"image\": \"busybox:1.36\",
@@ -144,7 +151,12 @@ kubectl run spire-agent-cleanup --restart=Never --rm \
       }],
       \"volumes\": [{\"name\":\"agent-data\",\"hostPath\":{\"path\":\"/run/spire/agent-data\"}}]
     }
-  }" 2>/dev/null && success "Agent data cleared" || warn "Cleanup pod skipped (may already be clean)"
+  }"
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/spire-agent-cleanup \
+  -n "${NAMESPACE}" --timeout=30s
+kubectl logs spire-agent-cleanup -n "${NAMESPACE}"
+kubectl delete pod spire-agent-cleanup -n "${NAMESPACE}" --ignore-not-found
+success "Agent data cleared"
 
 kubectl apply -f "${DEPLOY_DIR}/07-spire-agent.yaml"
 
