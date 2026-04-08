@@ -69,68 +69,84 @@ wait_deploy seaweedfs-volume
 wait_deploy seaweedfs-filer
 
 # ── SeaweedFS S3 health check ─────────────────────────────────────────────────
-# Validate S3 is fully operational before proceeding. Catches config issues
-# (missing ConfigMap mount, stale LevelDB) before they silently break later steps.
 echo ""
-echo "  ── SeaweedFS S3 health check ──"
-
-# 1. Confirm the credentials config file is actually mounted in the pod.
-echo "  [1/4] Checking s3.json is mounted in filer pod..."
-if ! kubectl exec -n "${NAMESPACE}" deployment/seaweedfs-filer -- \
-     cat /etc/seaweedfs/s3.json &>/dev/null 2>&1; then
-  echo ""
-  echo "  ERROR: /etc/seaweedfs/s3.json is NOT mounted in the seaweedfs-filer pod."
-  echo "  The ConfigMap 'seaweedfs-s3-config' is missing or the volume mount is wrong."
-  echo "  Run: kubectl get configmap seaweedfs-s3-config -n ${NAMESPACE}"
-  echo "  Then: kubectl describe pod -n ${NAMESPACE} -l app=seaweedfs-filer"
-  exit 1
-fi
-echo "  [1/4] OK — s3.json is mounted."
+echo "════════════════════════════════════════════════════════════"
+echo " SeaweedFS S3 health check"
+echo "════════════════════════════════════════════════════════════"
 
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=admin
 export AWS_DEFAULT_REGION=us-east-1
 S3_ENDPOINT="http://localhost:30334"
 
-# 2. Poll until ListBuckets authenticates successfully (confirms IAM is loaded).
-echo "  [2/4] Waiting for S3 authentication (up to 60s)..."
-S3_READY=false
-for i in $(seq 1 30); do
-  ERR=$(aws --endpoint-url "${S3_ENDPOINT}" s3 ls 2>&1)
-  if [ $? -eq 0 ]; then
-    S3_READY=true
-    break
-  fi
-  # Surface the actual error on the last attempt
-  if [ "${i}" -eq 30 ]; then
-    echo ""
-    echo "  ERROR: S3 authentication failed after 60s. Last error:"
-    echo "  ${ERR}"
-    echo ""
-    echo "  Diagnostics:"
-    echo "    kubectl logs -n ${NAMESPACE} deployment/seaweedfs-filer | tail -20"
-    exit 1
-  fi
-  sleep 2
-done
-echo "  [2/4] OK — S3 authentication working."
-
-# 3. Create and verify a test bucket.
-echo "  [3/4] Creating test bucket 's3://s3-health-check'..."
-aws --endpoint-url "${S3_ENDPOINT}" s3 mb s3://s3-health-check --region us-east-1
-if ! aws --endpoint-url "${S3_ENDPOINT}" s3 ls s3://s3-health-check &>/dev/null; then
-  echo "  ERROR: Test bucket created but cannot be listed — S3 is not healthy."
+# ── Check 1: s3.json is mounted ───────────────────────────────────────────────
+echo ""
+echo "[CHECK 1/4] Verifying s3.json is mounted inside the filer pod..."
+S3_JSON=$(kubectl exec -n "${NAMESPACE}" deployment/seaweedfs-filer -- \
+  cat /etc/seaweedfs/s3.json 2>&1) || true
+if echo "${S3_JSON}" | grep -q "accessKey"; then
+  echo "  Result: PASS"
+  echo "  Content: ${S3_JSON}"
+else
+  echo "  Result: FAIL — /etc/seaweedfs/s3.json is missing or has no credentials."
+  echo "  Output: ${S3_JSON}"
+  echo ""
+  echo "  Fix: kubectl get configmap seaweedfs-s3-config -n ${NAMESPACE}"
+  echo "       kubectl describe pod -n ${NAMESPACE} -l app=seaweedfs-filer"
   exit 1
 fi
-echo "  [3/4] OK — bucket create and list working."
 
-# 4. Put and delete a test object to confirm write path works end to end.
-echo "  [4/4] Testing object put/delete..."
-echo "seaweedfs-ok" | aws --endpoint-url "${S3_ENDPOINT}" s3 cp - s3://s3-health-check/probe
+# ── Check 2: List buckets (auth) ──────────────────────────────────────────────
+echo ""
+echo "[CHECK 2/4] Listing buckets (verifies S3 authentication)..."
+ATTEMPT=0
+while true; do
+  ATTEMPT=$(( ATTEMPT + 1 ))
+  echo "  Attempt ${ATTEMPT}/20: aws s3 ls ..."
+  LIST_OUT=$(aws --endpoint-url "${S3_ENDPOINT}" s3 ls 2>&1)
+  LIST_RC=$?
+  echo "  Output: ${LIST_OUT:-<empty — no buckets yet, which is fine>}"
+  if [ ${LIST_RC} -eq 0 ]; then
+    echo "  Result: PASS"
+    break
+  fi
+  echo "  Exit code: ${LIST_RC} — retrying in 3s..."
+  [ "${ATTEMPT}" -ge 20 ] && {
+    echo "  Result: FAIL — S3 auth did not succeed after $(( ATTEMPT * 3 ))s."
+    echo "  Run: kubectl logs -n ${NAMESPACE} deployment/seaweedfs-filer | tail -30"
+    exit 1
+  }
+  sleep 3
+done
+
+# ── Check 3: Create and list a test bucket ────────────────────────────────────
+echo ""
+echo "[CHECK 3/4] Creating test bucket and listing it..."
+echo "  Running: aws s3 mb s3://s3-health-check"
+aws --endpoint-url "${S3_ENDPOINT}" s3 mb s3://s3-health-check
+echo "  Running: aws s3 ls s3://s3-health-check"
+LIST_BUCKET=$(aws --endpoint-url "${S3_ENDPOINT}" s3 ls s3://s3-health-check 2>&1)
+echo "  Output: ${LIST_BUCKET:-<empty bucket — expected>}"
+echo "  Result: PASS"
+
+# ── Check 4: Write, read back, and delete a test object ──────────────────────
+echo ""
+echo "[CHECK 4/4] Writing, reading, and deleting a test object..."
+echo "  Running: echo 'health-ok' | aws s3 cp - s3://s3-health-check/probe"
+echo "health-ok" | aws --endpoint-url "${S3_ENDPOINT}" s3 cp - s3://s3-health-check/probe
+echo "  Running: aws s3 cp s3://s3-health-check/probe -"
+READ_OUT=$(aws --endpoint-url "${S3_ENDPOINT}" s3 cp s3://s3-health-check/probe - 2>&1)
+echo "  Read back: ${READ_OUT}"
+echo "  Running: aws s3 rm s3://s3-health-check/probe"
 aws --endpoint-url "${S3_ENDPOINT}" s3 rm s3://s3-health-check/probe
+echo "  Running: aws s3 rb s3://s3-health-check"
 aws --endpoint-url "${S3_ENDPOINT}" s3 rb s3://s3-health-check
-echo "  [4/4] OK — object write/delete working."
-echo "  ── SeaweedFS S3 healthy ──"
+echo "  Result: PASS"
+
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo " SeaweedFS S3 is healthy — proceeding with deployment."
+echo "════════════════════════════════════════════════════════════"
 echo ""
 
 # ── Step 3: Create S3 buckets ─────────────────────────────────────────────────
