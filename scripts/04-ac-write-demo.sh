@@ -53,6 +53,11 @@ db          = "poc_demo"
 src_full    = f"`{src_catalog}`.{db}.sensor_readings"
 dst_full    = f"`{dst_catalog}`.{db}.sensor_readings_ac"
 
+print(f"\n=== [0/4] Ensuring namespaces ===")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS `{src_catalog}`.{db}")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS `{dst_catalog}`.{db}")
+print(f"    Namespaces ready.")
+
 print(f"\n=== [1/4] Reading and deduplicating from {src_full} ===")
 df_raw = spark.sql(f"SELECT * FROM {src_full}")
 df_dedup = df_raw.dropDuplicates()

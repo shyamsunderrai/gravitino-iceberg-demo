@@ -46,6 +46,10 @@ db      = "poc_demo"
 table   = "sensor_readings"
 full    = f"`{catalog}`.{db}.{table}"
 
+print(f"\n=== [0/3] Ensuring namespace {catalog}.{db} ===")
+spark.sql(f"CREATE NAMESPACE IF NOT EXISTS `{catalog}`.{db}")
+print(f"    Namespace ready.")
+
 print(f"\n=== [1/3] Creating Iceberg table {full} (if not exists) ===")
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {full} (
