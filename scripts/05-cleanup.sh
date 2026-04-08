@@ -139,11 +139,19 @@ done
 # ── Step 3: Delete SeaweedFS PVCs ────────────────────────────────────────────
 echo ""
 echo "[3/4] Deleting SeaweedFS PVCs..."
-# Scale filer to 0 first to release the LevelDB lock before deleting its PVC.
-if kubectl get deployment/seaweedfs-filer -n "${NAMESPACE}" &>/dev/null; then
-  kubectl scale deployment/seaweedfs-filer -n "${NAMESPACE}" --replicas=0
-  kubectl wait --for=delete pod -l app=seaweedfs-filer -n "${NAMESPACE}" --timeout=60s 2>/dev/null || true
-fi
+# Scale ALL SeaweedFS deployments to 0 and wait for every pod to terminate
+# before deleting PVCs. If any deployment is still running it will hold the
+# PVC and block deletion — or immediately spin up a new pod that grabs it.
+for DEPLOY in seaweedfs-filer seaweedfs-volume seaweedfs-master; do
+  if kubectl get deployment/"${DEPLOY}" -n "${NAMESPACE}" &>/dev/null; then
+    echo "  Scaling ${DEPLOY} to 0..."
+    kubectl scale deployment/"${DEPLOY}" -n "${NAMESPACE}" --replicas=0
+  fi
+done
+echo "  Waiting for all SeaweedFS pods to terminate..."
+kubectl wait --for=delete pod -l "app in (seaweedfs-filer,seaweedfs-volume,seaweedfs-master)" \
+  -n "${NAMESPACE}" --timeout=90s 2>/dev/null || true
+
 for PVC in seaweedfs-filer-pvc seaweedfs-master-pvc seaweedfs-volume-pvc; do
   kubectl delete pvc "${PVC}" -n "${NAMESPACE}" --ignore-not-found \
     && echo "  Deleted ${PVC}." || true
