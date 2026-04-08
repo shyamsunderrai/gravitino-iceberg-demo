@@ -404,6 +404,59 @@ warn "For enforcement: install Calico, or test on EKS/GKE/AKS."
 
 ################################################################################
 # ════════════════════════════════════════════════════════════════════════════
+# PHASE 5.5: Pre-register SPIFFE users in Gravitino metalake
+#
+# WHY THIS MUST HAPPEN BEFORE OAUTH2 IS ENABLED:
+#
+#   Gravitino's authorization check (AuthorizationUtils.checkCurrentUser)
+#   requires the calling user to exist as a record in the metalake — even
+#   for service admins. Once OAuth2 is enabled in Phase 6, every API call
+#   needs a Bearer JWT and the user in that JWT must already be in the
+#   metalake. If they're not, Gravitino returns 403 regardless of the
+#   serviceAdmins config.
+#
+#   While Gravitino is still in simple-auth mode (before Phase 6), the API
+#   accepts unauthenticated calls. We use this window to pre-register all
+#   SPIFFE identities so they exist in the metalake when OAuth2 takes effect.
+# ════════════════════════════════════════════════════════════════════════════
+################################################################################
+
+echo ""
+echo "════════════════════════════════════════════════════════════════════════════"
+echo " Phase 5.5: Pre-registering SPIFFE users in Gravitino metalake"
+echo "════════════════════════════════════════════════════════════════════════════"
+
+info "Starting port-forward to Gravitino (simple-auth mode)..."
+kubectl port-forward svc/gravitino 17090:8090 -n "${NAMESPACE}" &
+PREUSER_PF_PID=$!
+trap "kill ${PREUSER_PF_PID} 2>/dev/null || true; kill ${PF_PID:-} 2>/dev/null || true" EXIT
+sleep 3
+
+METALAKE="poc_layer"
+for SPIFFE_USER in \
+  "spiffe://gravitino.demo/admin" \
+  "spiffe://gravitino.demo/spark-oc-writer" \
+  "spiffe://gravitino.demo/spark-ac-writer" \
+  "spiffe://gravitino.demo/gravitino"; do
+
+  info "Registering user: ${SPIFFE_USER}"
+  HTTP_CODE=$(curl -s -o /tmp/gravitino-user-resp.json -w "%{http_code}" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"name\": \"${SPIFFE_USER}\"}" \
+    "http://localhost:17090/api/metalakes/${METALAKE}/users")
+  case "${HTTP_CODE}" in
+    200|201) success "  Registered: ${SPIFFE_USER}" ;;
+    409)     success "  Already exists: ${SPIFFE_USER}" ;;
+    *)       warn "  HTTP ${HTTP_CODE} for ${SPIFFE_USER}: $(cat /tmp/gravitino-user-resp.json 2>/dev/null)" ;;
+  esac
+done
+
+kill ${PREUSER_PF_PID} 2>/dev/null || true
+success "SPIFFE users pre-registered — OAuth2 can now be enabled safely"
+
+################################################################################
+# ════════════════════════════════════════════════════════════════════════════
 # PHASE 6: Upgrade Gravitino with OAuth2 + RBAC
 #
 # LEARNING NOTE — What changes in Gravitino:
